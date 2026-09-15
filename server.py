@@ -1569,6 +1569,12 @@ async def cmd_model(msg: Message) -> None:
     gated = dm_command_gate(msg)
     if not gated:
         return
+
+    # Проверяем авторизацию
+    if not has_auth():
+        await msg.answer(f"{EMOJI_WARNING} Нет активной авторизации в Claude Code. Пожалуйста, выполните вход через <code>/login</code> или настройте API-ключ в <code>settings.json</code>.", parse_mode="HTML")
+        return
+
     access = gated["access"]
     alias_by_full = {full: a for a, full, _ in MODELS}
     try:
@@ -2906,14 +2912,33 @@ def make_resume_keyboard(page: int = 1) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
 
+def has_auth() -> bool:
+    """Проверяет наличие авторизации (OAuth или API-ключ)."""
+    # Проверяем OAuth
+    active_credentials = (USER_HOME / ".claude" / ".credentials.json")
+    if active_credentials.exists():
+        return True
+
+    # Проверяем API-ключ в settings.json
+    if SETTINGS_FILE.exists():
+        try:
+            settings = orjson.loads(SETTINGS_FILE.read_bytes())
+            env = settings.get("env", {})
+            if env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
 @dp.message(Command("resume"))
 async def cmd_resume(msg: Message) -> None:
     gated = dm_command_gate(msg)
     if not gated or gated["senderId"] not in gated["access"]["allowFrom"]:
         return
 
-    active_credentials = (USER_HOME / ".claude" / ".credentials.json")
-    if not active_credentials.exists():
+    if not has_auth():
         await msg.answer(f"{EMOJI_WARNING} Нет активной авторизации в Claude Code. Пожалуйста, выполните вход через <code>/login</code>.", parse_mode="HTML")
         return
 
@@ -3064,9 +3089,10 @@ async def cmd_usage(msg: Message) -> None:
     if not gated or gated["senderId"] not in gated["access"]["allowFrom"]:
         return
 
+    # Проверяем OAuth авторизацию (usage API требует OAuth, не работает с API-ключом)
     active_credentials = (USER_HOME / ".claude" / ".credentials.json")
     if not active_credentials.exists():
-        await msg.answer(f"{EMOJI_WARNING} Нет активной авторизации в Claude Code. Пожалуйста, выполните вход через <code>/login</code>.", parse_mode="HTML")
+        await msg.answer(f"{EMOJI_WARNING} Команда <code>/usage</code> работает только с OAuth-авторизацией. Выполните вход через <code>/login</code>.", parse_mode="HTML")
         return
 
     progress_msg = await msg.answer(f"<b>{EMOJI_REFRESH} Запрашиваю лимиты использования...</b>", parse_mode="HTML")
