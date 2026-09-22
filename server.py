@@ -197,6 +197,40 @@ MODELS = [
     ("fable5",  "claude-fable-5",           "Fable 5"),
 ]
 
+MODELS_FILE = STATE_DIR / "models.json"
+
+def load_custom_models() -> list:
+    try:
+        data = orjson.loads(MODELS_FILE.read_bytes())
+        out = []
+        for m in data:
+            a, f, d = m.get("alias"), m.get("id"), m.get("display")
+            if a and f and d:
+                out.append((str(a), str(f), str(d)))
+        return out
+    except Exception:
+        return []
+
+def save_custom_models(models: list) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        MODELS_FILE.write_bytes(orjson.dumps(
+            [{"alias": a, "id": f, "display": d} for a, f, d in models],
+            option=orjson.OPT_INDENT_2))
+    except Exception as e:
+        log(f"save_custom_models failed: {e}")
+
+def get_models() -> list:
+    """Built-in MODELS + custom from models.json (dedup by alias and id; built-ins win)."""
+    seen_alias = {a for a, _, _ in MODELS}
+    seen_id = {f for _, f, _ in MODELS}
+    out = list(MODELS)
+    for a, f, d in load_custom_models():
+        if a in seen_alias or f in seen_id:
+            continue
+        out.append((a, f, d)); seen_alias.add(a); seen_id.add(f)
+    return out
+
 EFFORT_LEVELS = [
     ("low",    "🔵 Low"),
     ("medium", "🟡 Medium"),
@@ -1576,21 +1610,27 @@ async def cmd_model(msg: Message) -> None:
         return
 
     access = gated["access"]
-    alias_by_full = {full: a for a, full, _ in MODELS}
+    alias_by_full = {full: a for a, full, _ in get_models()}
     try:
         raw = orjson.loads(SETTINGS_FILE.read_bytes()).get("model")
         current = alias_by_full.get(raw, raw) or access.get("model", "sonnet")
     except Exception:
         current = access.get("model", "sonnet")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(
             text=display,
             callback_data=f"model:{alias}",
             style="success" if alias == current else "primary",
             icon_custom_emoji_id="5870633910337015697" if alias == current else None
         )]
-        for alias, _, display in MODELS
-    ])
+        for alias, _, display in get_models()
+    ]
+    rows.append([InlineKeyboardButton(
+        text="➕ Добавить модель", callback_data="mdl:add", style="primary")])
+    if load_custom_models():
+        rows.append([InlineKeyboardButton(
+            text="🗑 Удалить модель", callback_data="mdl:manage", style="danger")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await bot.send_message(
         msg.chat.id,
         f"<b>{EMOJI_GEAR} Выберите модель Claude Code:</b>\nВступит в силу после перезапуска.",
@@ -1607,8 +1647,8 @@ async def on_model_callback(cb: CallbackQuery) -> None:
         await cb.answer("Нет доступа.")
         return
     alias = cb.data.split(":", 1)[1]
-    model_map = {a: full for a, full, _ in MODELS}
-    display_map = {a: d for a, _, d in MODELS}
+    model_map = {a: full for a, full, _ in get_models()}
+    display_map = {a: d for a, _, d in get_models()}
     if alias not in model_map:
         await cb.answer("Неизвестная модель", show_alert=False)
         return
@@ -1635,6 +1675,50 @@ async def on_model_callback(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
+@dp.callback_query(F.data == "mdl:add")
+async def on_model_add(cb: CallbackQuery) -> None:
+    if str(cb.from_user.id) not in load_access()["allowFrom"]:
+        await cb.answer("Нет доступа."); return
+    pending_model_add[str(cb.message.chat.id)] = True
+    await cb.message.answer(
+        f"{EMOJI_GEAR} Пришли модель одним сообщением в формате:\n"
+        f"<code>model-id Название</code>\n"
+        f"Например: <code>claude-opus-4-7 Opus 4.7</code>\n\n"
+        f"Отмена: /cancel",
+        parse_mode="HTML")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "mdl:manage")
+async def on_model_manage(cb: CallbackQuery) -> None:
+    if str(cb.from_user.id) not in load_access()["allowFrom"]:
+        await cb.answer("Нет доступа."); return
+    custom = load_custom_models()
+    if not custom:
+        await cb.answer("Нет кастомных моделей", show_alert=False); return
+    rows = [[InlineKeyboardButton(text=f"🗑 {d}", callback_data=f"mdl:del:{a}", style="danger")]
+            for a, f, d in custom]
+    await cb.message.edit_text(
+        f"<b>{EMOJI_GEAR} Удалить кастомную модель:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("mdl:del:"))
+async def on_model_del(cb: CallbackQuery) -> None:
+    if str(cb.from_user.id) not in load_access()["allowFrom"]:
+        await cb.answer("Нет доступа."); return
+    alias = cb.data.split(":", 2)[2]
+    custom = load_custom_models()
+    new = [(a, f, d) for a, f, d in custom if a != alias]
+    save_custom_models(new)
+    await cb.message.edit_text(
+        f"{EMOJI_SUCCESS} Модель удалена (<code>{alias}</code>).\nОткрой /model заново.",
+        parse_mode="HTML")
+    await cb.answer("Удалено")
+
+
 @dp.callback_query(F.data == "restart_confirm")
 async def on_restart_confirm(cb: CallbackQuery) -> None:
     access = load_access()
@@ -1651,7 +1735,7 @@ async def cmd_effort(msg: Message) -> None:
     if not gated:
         return
     access = gated["access"]
-    alias_by_full = {full: a for a, full, _ in MODELS}
+    alias_by_full = {full: a for a, full, _ in get_models()}
     try:
         _s = orjson.loads(SETTINGS_FILE.read_bytes())
         current_effort = _s.get("effortLevel") or access.get("effortLevel", "medium")
@@ -1810,6 +1894,7 @@ async def cmd_start(msg: Message) -> None:
 
 
 active_login_flows = {}
+pending_model_add: dict = {}
 
 def list_profiles() -> list[dict]:
     import glob
@@ -3626,6 +3711,36 @@ def _html_caption(msg) -> str:
 @dp.message(F.text)
 async def on_text(msg: Message) -> None:
     chat_id = str(msg.chat.id)
+    if chat_id in pending_model_add:
+        if str(msg.from_user.id) not in load_access()["allowFrom"]:
+            return
+        pending_model_add.pop(chat_id, None)
+        txt = (msg.text or "").strip()
+        if txt.lower() in ("/cancel", "отмена"):
+            await msg.answer("Отменено.", parse_mode="HTML"); return
+        parts = txt.split(None, 1)
+        mid = parts[0].strip()
+        disp = parts[1].strip() if len(parts) > 1 else mid
+        if not re.match(r"^[A-Za-z0-9._-]+$", mid):
+            await msg.answer(f"{EMOJI_WARNING} Некорректный model-id. Формат: <code>model-id Название</code>", parse_mode="HTML"); return
+        existing_ids = {f for _, f, _ in get_models()}
+        if mid in existing_ids:
+            await msg.answer(f"{EMOJI_WARNING} Модель с таким id уже есть.", parse_mode="HTML"); return
+        # alias: slug from id, unique
+        base_alias = re.sub(r"[^a-z0-9]", "", mid.lower().replace("claude-", "")) or "model"
+        alias = base_alias; i = 2
+        used = {a for a, _, _ in get_models()}
+        while alias in used:
+            alias = f"{base_alias}{i}"; i += 1
+        custom = load_custom_models()
+        custom.append((alias, mid, disp))
+        save_custom_models(custom)
+        await msg.answer(
+            f"{EMOJI_SUCCESS} Модель добавлена:\n"
+            f"<blockquote><b>{disp}</b>\nid: <code>{mid}</code>\nалиас: <code>{alias}</code></blockquote>\n"
+            f"Открой /model, чтобы выбрать.",
+            parse_mode="HTML")
+        return
     if chat_id in active_login_flows:
         flow = active_login_flows[chat_id]
         if flow["status"] == "waiting_code":

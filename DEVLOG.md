@@ -73,3 +73,8 @@
 
 Не трогалось: billing / weekly / 5-hour / auth(401) / rate-limit / overloaded,
 форк-сессии, ветка «no conversation found», прочие колбэки.
+
+## 2026-09-22 — editable model list
+- Модели теперь читаются из ~/.claude/channels/telegram/models.json в рантайме поверх встроенного MODELS. Новые функции load_custom_models/save_custom_models/get_models; все обращения к MODELS в /model, коллбэке выбора и /effort заменены на get_models().
+- Управление кнопками в /model: «➕ Добавить модель» (mdl:add → просит `model-id Название` след. сообщением, захват в on_text через pending_model_add), «🗑 Удалить модель» (mdl:manage → mdl:del:<alias>), только владелец. Добавление/удаление БЕЗ рестарта; рестарт только для применения активной модели.
+- Засеяны Fable 5.1 (claude-fable-5-1) и Opus 4.7 (claude-opus-4-7). Тесты tests/test_model_editing.py (5). pytest: +5 passed (4 pre-existing usage-locale фейла не связаны).
