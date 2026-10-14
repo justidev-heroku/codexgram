@@ -1,5 +1,28 @@
 # DEVLOG
 
+## 2026-10-14 — Гостевые версии команд
+
+- Гостю доступны свои `/model`, `/effort`, `/auto`, `/resume`, `/goal`, `/close`
+  (= `/new`), `/restart`, `/usage`, плюс `/new`, `/stop`. Владельческие хэндлеры
+  сначала проверяют `guest_cmd_sender()` и для гостя зовут `guest_cmd_*`; у
+  владельца поведение прежнее.
+- Настройки гостя — файлы в `guests/<id>/` (`model`, `effort`, `auto`, `goal`),
+  применяются со следующего запуска: `--model`, `--effort`, `/auto` выкл →
+  `--permission-mode dontAsk` + `permissions.deny` на Bash/Edit/Write/MultiEdit/
+  NotebookEdit во флаговых `--settings` (иначе allow `Bash` из settings.json
+  владельца пропустил бы shell), цель — в `--append-system-prompt`.
+  Кнопки гостя — отдельные префиксы `gmodel:`, `geffort:`, `gres:`, `ggoal_clear`,
+  проверка `guest_gate_cb` (только гость и только в своей личке).
+- `/resume` гостя: сессии из `~/.claude/projects/<ключ ~/guests/<id>>/`, выбор
+  пишет `guests/<id>/session_id`. `/restart` гостя — kill его запуска + очистка
+  очереди, бот не перезапускается. `/usage` — лимиты общего аккаунта владельца.
+- Аккаунт Claude у гостей всегда владельца: `/accounts`, `/login`, `/save_account`,
+  `/switch_account`, `/delete_account`, `/logout`, `/check_update`, `/mcp_debug`,
+  `/share`, `/unshare`, `/access` — только владельцу.
+- Меню: гостям `BotCommandScopeChat` со своим набором (при старте бота и `/share`),
+  при `/unshare` scope удаляется; из общего меню убраны `/new` и `/stop`.
+- Тесты: `tests/test_guest_commands.py`.
+
 ## 2026-10-14 — Гости работают независимо от владельца
 
 - Сообщения гостей больше не инжектятся в сессию владельца и не дублируются

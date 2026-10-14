@@ -224,10 +224,11 @@ def test_dm_command_gate_owner_guest_stranger(state):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("handler", ["cmd_share", "cmd_unshare", "cmd_access", "cmd_model", "cmd_effort",
-                                     "cmd_allows", "cmd_delete", "cmd_restart", "cmd_goal", "cmd_login",
+# /model /effort /auto /close /restart /goal /resume /usage у гостя — свои версии
+# (tests/test_guest_commands.py); здесь — только команды, оставшиеся у владельца.
+@pytest.mark.parametrize("handler", ["cmd_share", "cmd_unshare", "cmd_access", "cmd_login",
                                      "cmd_logout", "cmd_switch_account", "cmd_mcp_debug", "cmd_check_update",
-                                     "cmd_resume", "cmd_usage"])
+                                     "cmd_accounts", "cmd_save_account", "cmd_delete_account"])
 def test_guest_denied_admin_commands(state, handler):
     write_access(state, {"allowFrom": [OWNER, GUEST]})
     server.load_access()  # миграция owner

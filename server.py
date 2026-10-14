@@ -54,6 +54,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -1694,8 +1695,54 @@ def guest_work_dir(uid: str) -> Path:
     return (Path(base) if base else USER_HOME / "guests") / str(uid)
 
 
-def guest_model() -> str | None:
-    """Модель гостя: env CLAUDE_GRAM_GUEST_MODEL > файл guest_model > модель владельца."""
+# Персональные настройки гостя — файлы в guests/<id>/ (model, effort, auto, goal).
+# Действуют только на запуски этого гостя; настройки владельца не трогаются.
+GUEST_SETTING_NAMES = ("model", "effort", "auto", "goal")
+# При выключенном /auto гость работает в режиме dontAsk (всё, что требует
+# разрешения, отклоняется без вопроса), а изменяющие инструменты запрещены явно —
+# иначе allow-правила из settings.json владельца (например, "Bash") их бы пропустили.
+GUEST_RESTRICTED_TOOLS = ("Bash", "Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def read_guest_setting(uid: str, name: str) -> str:
+    try:
+        return (guest_state_dir(uid) / name).read_text("utf-8").strip()
+    except OSError:
+        return ""
+
+
+def write_guest_setting(uid: str, name: str, value: str | None) -> None:
+    """value=None/"" — сброс к значению по умолчанию."""
+    if name not in GUEST_SETTING_NAMES:
+        raise ValueError(f"unknown guest setting {name}")
+    path = guest_state_dir(uid) / name
+    if not value:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, "utf-8")
+
+
+def guest_auto(uid: str) -> bool:
+    """/auto гостя: по умолчанию включён (bypassPermissions)."""
+    return read_guest_setting(uid, "auto") != "off"
+
+
+def guest_effort(uid: str) -> str | None:
+    val = read_guest_setting(uid, "effort")
+    return val if val in {lvl for lvl, _ in EFFORT_LEVELS} else None
+
+
+def guest_model_alias(uid: str) -> str:
+    return read_guest_setting(uid, "model")
+
+
+def guest_model(uid: str | None = None) -> str | None:
+    """Модель гостя: свой выбор (/model) > env CLAUDE_GRAM_GUEST_MODEL > файл guest_model > модель владельца."""
+    if uid is not None:
+        alias = guest_model_alias(uid)
+        if alias:
+            return {a: full for a, full, _ in get_models()}.get(alias, alias)
     env = (os.environ.get("CLAUDE_GRAM_GUEST_MODEL") or "").strip()
     if env:
         return env
@@ -1721,8 +1768,9 @@ def guest_env() -> dict:
     return env
 
 
-def _disabled_plugins_settings() -> str:
-    """--settings, выключающий плагин claude-gram (и любые его копии) в гостевом claude."""
+def _disabled_plugins_settings(restricted: bool = False) -> str:
+    """--settings, выключающий плагин claude-gram (и любые его копии) в гостевом claude.
+    restricted=True (гость выключил /auto) — плюс запрет изменяющих инструментов."""
     plugins = {GUEST_PLUGIN_ID: False}
     try:
         enabled = orjson.loads(SETTINGS_FILE.read_bytes()).get("enabledPlugins") or {}
@@ -1731,12 +1779,27 @@ def _disabled_plugins_settings() -> str:
                 plugins[key] = False
     except Exception:  # noqa: BLE001
         pass
-    return orjson.dumps({"enabledPlugins": plugins}).decode()
+    settings = {"enabledPlugins": plugins}
+    if restricted:
+        settings["permissions"] = {"deny": list(GUEST_RESTRICTED_TOOLS)}
+    return orjson.dumps(settings).decode()
 
 
-def guest_system_prompt(uid: str, name: str) -> str:
+def guest_system_prompt(uid: str, name: str, goal: str = "", auto: bool = True) -> str:
     who = f"{name} (Telegram id {uid})" if name else f"Telegram user {uid}"
     work = guest_work_dir(uid)
+    extra = []
+    if not auto:
+        extra.append(
+            "Restricted mode: the user turned auto-approval off, so shell commands and file edits are denied"
+            " (" + ", ".join(GUEST_RESTRICTED_TOOLS) + "). Do not retry denied tools; say what you could not do"
+            " and that the user can enable it with /auto."
+        )
+    if goal:
+        extra.append(
+            f"Session goal set by the user: {goal}\n"
+            "Work towards this goal and say explicitly when it is achieved."
+        )
     return "\n".join([
         f"You are working for {who}, a guest user who talks to you through a Telegram bot.",
         "They see ONLY the final text of your answer for each message; it is delivered as plain text"
@@ -1749,7 +1812,7 @@ def guest_system_prompt(uid: str, name: str) -> str:
         "Do not modify or stop the Telegram bridge itself (~/.claude/channels/telegram, the claude-gram plugin,"
         " the claude-telegram service) — that would break the bot for everyone.",
         "Answer in the language the user writes in.",
-    ])
+    ] + extra)
 
 
 def build_guest_prompt(text: str, meta: dict) -> str:
@@ -1767,17 +1830,20 @@ def build_guest_prompt(text: str, meta: dict) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def build_guest_cmd(uid: str, session_args: list, name: str = "", model: str | None = None) -> list:
+def build_guest_cmd(uid: str, session_args: list, name: str = "", model: str | None = None,
+                    effort: str | None = None, auto: bool = True, goal: str = "") -> list:
     cmd = [
         resolve_claude_bin(), "-p",
         "--output-format", "stream-json", "--verbose",
-        "--permission-mode", "bypassPermissions",
+        "--permission-mode", "bypassPermissions" if auto else "dontAsk",
         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-        "--settings", _disabled_plugins_settings(),
-        "--append-system-prompt", guest_system_prompt(uid, name),
+        "--settings", _disabled_plugins_settings(restricted=not auto),
+        "--append-system-prompt", guest_system_prompt(uid, name, goal, auto),
     ]
     if model:
         cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
     return cmd + list(session_args)
 
 
@@ -1823,6 +1889,15 @@ def parse_stream_event(line) -> list:
                 out.append(("text", c["text"]))
         return out
     if typ == "result":
+        out = []
+        denials = obj.get("permission_denials")
+        if isinstance(denials, list) and denials:
+            names = []
+            for d in denials:
+                n = (d.get("tool_name") if isinstance(d, dict) else None) or "tool"
+                if n not in names:
+                    names.append(n)
+            out.append(("denied", names))
         res = obj.get("result")
         if not isinstance(res, str):
             res = ""
@@ -1830,7 +1905,7 @@ def parse_stream_event(line) -> list:
         if is_error and not res:
             errs = obj.get("errors")
             res = "; ".join(map(str, errs)) if isinstance(errs, list) and errs else str(obj.get("subtype") or "error")
-        return [("result", res, is_error, obj.get("session_id") or "")]
+        return out + [("result", res, is_error, obj.get("session_id") or "")]
     return []
 
 
@@ -1951,7 +2026,7 @@ async def _spawn_guest_process(cmd: list, cwd: str, env: dict):
 async def run_guest_process(gs: GuestSession, cmd: list, prompt: str, cwd: str, on_session=None) -> dict:
     """Запускает гостевой claude и разбирает stream-json. Возвращает итог запуска."""
     out = {"result": None, "is_error": False, "texts": [], "session_id": "", "stderr": "",
-           "rc": None, "timed_out": False, "stopped": False}
+           "rc": None, "timed_out": False, "stopped": False, "denied": []}
     gs.actions = []
     proc = await _spawn_guest_process(cmd, cwd, guest_env())
     gs.proc = proc
@@ -1984,6 +2059,8 @@ async def run_guest_process(gs: GuestSession, cmd: list, prompt: str, cwd: str, 
                         del gs.actions[:-GUEST_STATUS_ACTIONS]
                     elif ev[0] == "text":
                         out["texts"].append(ev[1])
+                    elif ev[0] == "denied":
+                        out["denied"] = ev[1]
                     elif ev[0] == "result":
                         out["result"], out["is_error"] = ev[1], ev[2]
                         out["session_id"] = ev[3] or out["session_id"]
@@ -2082,7 +2159,10 @@ async def run_guest_job(gs: GuestSession, job: dict) -> None:
         except Exception as e:  # noqa: BLE001
             log(f"guest status bubble failed: {e}")
 
-        model = guest_model()
+        model = guest_model(uid)
+        effort = guest_effort(uid)
+        auto = guest_auto(uid)
+        goal = read_guest_setting(uid, "goal")
         res = None
         for attempt in range(2):
             gen = gs.generation
@@ -2097,8 +2177,9 @@ async def run_guest_job(gs: GuestSession, job: dict) -> None:
                 if gs.generation == gen:
                     write_guest_session_id(uid, s)
 
-            cmd = build_guest_cmd(uid, session_args, job.get("name", ""), model)
-            log(f"guest {uid}: run {session_args[0]} {sid} model={model}")
+            cmd = build_guest_cmd(uid, session_args, job.get("name", ""), model,
+                                  effort=effort, auto=auto, goal=goal)
+            log(f"guest {uid}: run {session_args[0]} {sid} model={model} effort={effort} auto={auto}")
             res = await run_guest_process(gs, cmd, job["prompt"], str(work), _on_session)
             # Сессия пропала (удалена/другой аккаунт) — начинаем новую один раз.
             if (attempt == 0 and session_args[0] == "--resume" and not res["stopped"]
@@ -2138,7 +2219,10 @@ async def run_guest_job(gs: GuestSession, job: dict) -> None:
         errors = await send_guest_files(chat_id, files)
         if errors:
             await send_guest_text(chat_id, "⚠️ Не удалось отправить:\n" + "\n".join(errors))
-    if not text and not files:
+    if res.get("denied"):
+        await send_guest_text(
+            chat_id, "🔒 Отклонено (авто-режим выключен): " + ", ".join(res["denied"]) + ". Включить — /auto.")
+    elif not text and not files:
         await send_guest_text(chat_id, "✅ Готово (пустой ответ).")
 
 
@@ -2302,6 +2386,9 @@ def buffer_album_item(msg: Message, item: dict) -> None:
 
 
 async def cmd_model(msg: Message) -> None:
+    if (guest_uid := guest_cmd_sender(msg)):
+        await guest_cmd_model(msg, guest_uid)
+        return
     gated = dm_command_gate(msg)
     if not gated:
         return
@@ -2433,6 +2520,9 @@ async def on_restart_confirm(cb: CallbackQuery) -> None:
 
 
 async def cmd_effort(msg: Message) -> None:
+    if (guest_uid := guest_cmd_sender(msg)):
+        await guest_cmd_effort(msg, guest_uid)
+        return
     gated = dm_command_gate(msg)
     if not gated:
         return
@@ -2508,6 +2598,9 @@ dp.message.register(cmd_effort, Command("effort"))
 @dp.message(Command("auto"))
 async def cmd_allows(msg: Message) -> None:
     global auto_allow
+    if (guest_uid := guest_cmd_sender(msg)):
+        await guest_cmd_auto(msg, guest_uid)
+        return
     gated = dm_command_gate(msg)
     if not gated:
         return
@@ -2688,16 +2781,24 @@ def access_list_text() -> str:
 async def cmd_share(msg: Message) -> None:
     if not dm_command_gate(msg):
         return
-    _, text = share_access(_cmd_arg(msg))
+    before = set(load_access()["allowFrom"])
+    ok, text = share_access(_cmd_arg(msg))
     await msg.answer(text, parse_mode="HTML")
+    if ok:
+        for uid in set(load_access()["allowFrom"]) - before:
+            await set_guest_commands(uid)
 
 
 @dp.message(Command("unshare"))
 async def cmd_unshare(msg: Message) -> None:
     if not dm_command_gate(msg):
         return
-    _, text = unshare_access(_cmd_arg(msg))
+    before = set(load_access()["allowFrom"])
+    ok, text = unshare_access(_cmd_arg(msg))
     await msg.answer(text, parse_mode="HTML")
+    if ok:
+        for uid in before - set(load_access()["allowFrom"]):
+            await clear_guest_commands(uid)
 
 
 @dp.message(Command("access"))
@@ -2721,6 +2822,12 @@ def _guest_command_sender(msg: Message) -> tuple[str | None, bool]:
 OWNER_GUEST_CMD_HINT = "ℹ️ /new и /stop — команды гостевых сессий. Для своей сессии: /close, /resume, /restart."
 
 
+async def guest_new_session(msg: Message, uid: str) -> None:
+    reset_guest_session(uid)
+    note = " Текущий запуск продолжится; прервать — /stop." if guest_is_busy(uid) else ""
+    await msg.answer("🆕 Новая сессия: следующее сообщение начнёт диалог с чистого листа." + note)
+
+
 @dp.message(Command("new"))
 async def cmd_guest_new(msg: Message) -> None:
     uid, guest = _guest_command_sender(msg)
@@ -2729,9 +2836,7 @@ async def cmd_guest_new(msg: Message) -> None:
     if not guest:
         await msg.answer(OWNER_GUEST_CMD_HINT)
         return
-    reset_guest_session(uid)
-    note = " Текущий запуск продолжится; прервать — /stop." if guest_is_busy(uid) else ""
-    await msg.answer("🆕 Новая сессия: следующее сообщение начнёт диалог с чистого листа." + note)
+    await guest_new_session(msg, uid)
 
 
 @dp.message(Command("stop"))
@@ -2747,6 +2852,287 @@ async def cmd_guest_stop(msg: Message) -> None:
     # при активном запуске итог «⏹ Остановлено.» пришлёт сам раннер
 
 
+# ---------------------------------------------------------------------------
+# Гостевые версии команд: /model /effort /auto /resume /goal /close /restart /usage
+# Действуют только на запуски и настройки самого гостя (guests/<id>/), у владельца
+# ничего не меняется. Владельческие хэндлеры сначала проверяют guest_cmd_sender()
+# и при госте передают управление сюда.
+# ---------------------------------------------------------------------------
+
+GUEST_BOT_COMMANDS = [
+    ("new", "Начать новую сессию"),
+    ("stop", "Прервать текущий запуск"),
+    ("close", "Закрыть сессию (то же, что /new)"),
+    ("resume", "Вернуться к прошлой сессии"),
+    ("model", "Модель для моих запусков"),
+    ("effort", "Уровень effort для моих запусков"),
+    ("auto", "Авто-разрешение действий вкл/выкл"),
+    ("goal", "Цель сессии"),
+    ("restart", "Перезапустить мой раннер"),
+    ("usage", "Лимиты использования Claude"),
+]
+
+
+def guest_cmd_sender(msg: Message) -> str | None:
+    """uid, если команду прислал гость в личке; иначе None (владелец/чужой/не личка)."""
+    uid, guest = _guest_command_sender(msg)
+    return uid if guest else None
+
+
+def guest_gate_cb(cb: CallbackQuery) -> str | None:
+    """Кнопки гостевых команд: только гость и только в своей личке. -> uid или None."""
+    if not cb.from_user:
+        return None
+    uid = str(cb.from_user.id)
+    if not is_guest(uid):
+        return None
+    chat = getattr(getattr(cb, "message", None), "chat", None)
+    if chat is None or str(chat.id) != uid:
+        return None
+    return uid
+
+
+async def set_guest_commands(uid: str) -> None:
+    """Меню команд гостя (scope его чата). Ошибки не фатальны."""
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command=c, description=d) for c, d in GUEST_BOT_COMMANDS],
+            scope=BotCommandScopeChat(chat_id=int(uid)),
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"set guest commands {uid} failed: {e}")
+
+
+async def clear_guest_commands(uid: str) -> None:
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=int(uid)))
+    except Exception as e:  # noqa: BLE001
+        log(f"delete guest commands {uid} failed: {e}")
+
+
+def restart_guest_runner(uid: str) -> bool:
+    """/restart гостя: прерывает его текущий запуск и чистит очередь. Бот не трогается.\n    Сессия (session_id) и настройки сохраняются. True — было что прерывать."""
+    had = stop_guest_runs(uid)
+    gs = guest_sessions.get(str(uid))
+    if gs is not None:
+        gs.actions = []
+    return had
+
+
+def _mark(selected: bool) -> dict:
+    return {"style": "success" if selected else "primary",
+            "icon_custom_emoji_id": "5870633910337015697" if selected else None}
+
+
+def guest_model_keyboard(uid: str) -> InlineKeyboardMarkup:
+    current = guest_model_alias(uid)
+    rows = [[InlineKeyboardButton(text=display, callback_data=f"gmodel:{alias}", **_mark(alias == current))]
+            for alias, _, display in get_models()]
+    rows.append([InlineKeyboardButton(text="По умолчанию", callback_data="gmodel:default", **_mark(not current))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _guest_model_label(uid: str) -> str:
+    alias = guest_model_alias(uid)
+    if alias:
+        return {a: d for a, _, d in get_models()}.get(alias, alias)
+    return f"по умолчанию ({guest_model() or 'как у Claude Code'})"
+
+
+async def guest_cmd_model(msg: Message, uid: str) -> None:
+    await msg.answer(
+        f"<b>{EMOJI_GEAR} Модель для ваших запусков</b>\n"
+        f"Сейчас: <code>{_esc(_guest_model_label(uid))}</code>\n"
+        f"Применится со следующего сообщения.",
+        parse_mode="HTML", reply_markup=guest_model_keyboard(uid))
+
+
+@dp.callback_query(F.data.startswith("gmodel:"))
+async def on_guest_model_callback(cb: CallbackQuery) -> None:
+    uid = guest_gate_cb(cb)
+    if not uid:
+        await cb.answer("Нет доступа.")
+        return
+    alias = cb.data.split(":", 1)[1]
+    if alias == "default":
+        write_guest_setting(uid, "model", None)
+    elif alias in {a for a, _, _ in get_models()}:
+        write_guest_setting(uid, "model", alias)
+    else:
+        await cb.answer("Неизвестная модель")
+        return
+    try:
+        await cb.message.edit_text(
+            f"<b>{EMOJI_SUCCESS} Модель для ваших запусков:</b> <code>{_esc(_guest_model_label(uid))}</code>\n"
+            f"Применится со следующего сообщения.",
+            parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer()
+
+
+def _guest_effort_label(uid: str) -> str:
+    lvl = guest_effort(uid)
+    return dict(EFFORT_LEVELS)[lvl] if lvl else "по умолчанию"
+
+
+async def guest_cmd_effort(msg: Message, uid: str) -> None:
+    current = guest_effort(uid)
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"geffort:{lvl}", **_mark(lvl == current))]
+            for lvl, label in EFFORT_LEVELS]
+    rows.append([InlineKeyboardButton(text="По умолчанию", callback_data="geffort:default", **_mark(not current))])
+    model = guest_model(uid) or ""
+    warning = (f"\n\n{EMOJI_WARNING} Haiku не поддерживает extended thinking — xhigh и max не дадут эффекта."
+               if "haiku" in model.lower() else "")
+    await msg.answer(
+        f"<b>{EMOJI_BRAIN} Уровень effort для ваших запусков</b>\n"
+        f"Сейчас: <code>{_esc(_guest_effort_label(uid))}</code>{warning}",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("geffort:"))
+async def on_guest_effort_callback(cb: CallbackQuery) -> None:
+    uid = guest_gate_cb(cb)
+    if not uid:
+        await cb.answer("Нет доступа.")
+        return
+    level = cb.data.split(":", 1)[1]
+    if level == "default":
+        write_guest_setting(uid, "effort", None)
+    elif level in {lvl for lvl, _ in EFFORT_LEVELS}:
+        write_guest_setting(uid, "effort", level)
+    else:
+        await cb.answer("Неизвестный уровень")
+        return
+    try:
+        await cb.message.edit_text(
+            f"<b>{EMOJI_SUCCESS} Effort для ваших запусков:</b> <code>{_esc(_guest_effort_label(uid))}</code>\n"
+            f"Применится со следующего сообщения.",
+            parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer()
+
+
+async def guest_cmd_auto(msg: Message, uid: str) -> None:
+    on = not guest_auto(uid)
+    write_guest_setting(uid, "auto", None if on else "off")
+    if on:
+        text = (f"<b>{EMOJI_SUCCESS} Авто-разрешение включено</b>\n"
+                "<blockquote>Claude выполняет команды и правит файлы без подтверждений.</blockquote>")
+    else:
+        text = (f"<b>{EMOJI_WARNING} Авто-разрешение выключено</b>\n"
+                "<blockquote>Команды shell и правка файлов будут отклоняться — Claude только читает и отвечает. "
+                "Отклонённые действия видны в ответе. Повтори <code>/auto</code>, чтобы включить.</blockquote>")
+    await msg.answer(text, parse_mode="HTML")
+
+
+def guest_project_dir(uid: str) -> Path:
+    """Каталог сессий гостя: ~/.claude/projects/<ключ рабочего каталога гостя>."""
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (USER_HOME / ".claude"))
+    key = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(str(guest_work_dir(uid))))
+    return base / "projects" / key
+
+
+async def guest_cmd_resume(msg: Message, uid: str) -> None:
+    kb = make_resume_keyboard(1, guest_project_dir(uid), read_guest_session_id(uid), prefix="gres")
+    await msg.answer(f"<b>{EMOJI_ROBOT} Ваши сессии:</b>", parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("gres:"))
+async def on_guest_resume_callback(cb: CallbackQuery) -> None:
+    uid = guest_gate_cb(cb)
+    if not uid:
+        await cb.answer("Нет доступа.")
+        return
+    parts = cb.data.split(":", 2)
+    sub = parts[1] if len(parts) > 1 else ""
+    if sub == "noop":
+        await cb.answer()
+        return
+    if sub == "cancel":
+        try:
+            await cb.message.edit_text("<b>Отменено.</b>", parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+        await cb.answer()
+        return
+    if sub == "pg":
+        try:
+            page = int(parts[2])
+        except (IndexError, ValueError):
+            page = 1
+        kb = make_resume_keyboard(page, guest_project_dir(uid), read_guest_session_id(uid), prefix="gres")
+        try:
+            await cb.message.edit_reply_markup(reply_markup=kb)
+        except Exception:  # noqa: BLE001
+            pass
+        await cb.answer()
+        return
+    note = " Текущий запуск продолжится; прервать — /stop." if guest_is_busy(uid) else ""
+    if sub == "new":
+        reset_guest_session(uid)
+        text = "🆕 Новая сессия: следующее сообщение начнёт диалог с чистого листа." + note
+    elif sub == "sel" and len(parts) > 2 and re.fullmatch(r"[A-Za-z0-9_-]+", parts[2]):
+        sid = parts[2]
+        if not (guest_project_dir(uid) / f"{sid}.jsonl").is_file():
+            await cb.answer("Сессия не найдена.")
+            return
+        _guest(uid).generation += 1  # активный запуск не перезапишет выбор
+        write_guest_session_id(uid, sid)
+        text = f"{EMOJI_SUCCESS} Сессия выбрана — следующее сообщение продолжит её." + note
+    else:
+        await cb.answer()
+        return
+    try:
+        await cb.message.edit_text(text, parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer()
+
+
+async def guest_cmd_goal(msg: Message, uid: str) -> None:
+    arg = _cmd_arg(msg)
+    if arg:
+        write_guest_setting(uid, "goal", arg)
+        await msg.answer(f"🎯 <b>Цель сессии задана:</b>\n<blockquote>{_esc(arg)}</blockquote>", parse_mode="HTML")
+        await enqueue_guest_message(uid, str(msg.chat.id), arg,
+                                    _full_name(msg.from_user) or msg.from_user.username or "")
+        return
+    current = read_guest_setting(uid, "goal")
+    if current:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="Сбросить цель", callback_data="ggoal_clear", style="danger",
+            icon_custom_emoji_id="5255949705740843980")]])
+        await msg.answer(f"🎯 <b>Текущая цель сессии:</b>\n<blockquote>{_esc(current)}</blockquote>",
+                         parse_mode="HTML", reply_markup=kb)
+    else:
+        await msg.answer("🎯 <b>Цель сессии не задана.</b>\n\nИспользование: <code>/goal &lt;текст цели&gt;</code>",
+                         parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "ggoal_clear")
+async def on_guest_goal_clear(cb: CallbackQuery) -> None:
+    uid = guest_gate_cb(cb)
+    if not uid:
+        await cb.answer("Нет доступа.")
+        return
+    write_guest_setting(uid, "goal", None)
+    try:
+        await cb.message.edit_text("🎯 <b>Цель сессии сброшена.</b>", parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer("Сброшено")
+
+
+async def guest_cmd_restart(msg: Message, uid: str) -> None:
+    if restart_guest_runner(uid):
+        await msg.answer("🔄 Раннер перезапущен: текущий запуск прерван, очередь очищена. "
+                         "Сессия сохранена (новая — /new).")
+    else:
+        await msg.answer("🔄 Раннер готов: сейчас ничего не выполнялось.")
+
+
 @dp.message(Command("start"))
 async def cmd_start(msg: Message) -> None:
     if msg.chat.type != ChatType.PRIVATE or not msg.from_user:
@@ -2754,6 +3140,10 @@ async def cmd_start(msg: Message) -> None:
     access = load_access()
     sender_id = str(msg.from_user.id)
     if sender_id in access["allowFrom"]:
+        if is_guest(sender_id, access):
+            await msg.answer("Бот работает. Ваши команды:\n" + "\n".join(
+                f"/{c} — {d}" for c, d in GUEST_BOT_COMMANDS))
+            return
         await msg.answer("Бот работает.")
         return
     # Бот не настроен (нет владельца) – показываем ID для завершения онбординга.
@@ -3721,13 +4111,16 @@ def get_active_session_id() -> str:
     return ""
 
 
-def make_resume_keyboard(page: int = 1) -> InlineKeyboardMarkup:
-    project_dir = (USER_HOME / ".claude" / "projects" / "-root")
+def make_resume_keyboard(page: int = 1, project_dir: Path | None = None, active_id: str | None = None,
+                         prefix: str = "res") -> InlineKeyboardMarkup:
+    """prefix="gres" + project_dir/active_id гостя — та же клавиатура для гостевого /resume."""
+    if project_dir is None:
+        project_dir = (USER_HOME / ".claude" / "projects" / "-root")
     if not project_dir.exists():
         return InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="Начать новую сессию",
-                callback_data="res:new",
+                callback_data=f"{prefix}:new",
                 style="success",
                 icon_custom_emoji_id="5870633910337015697"
             )
@@ -3791,7 +4184,7 @@ def make_resume_keyboard(page: int = 1) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="Начать новую сессию",
-                callback_data="res:new",
+                callback_data=f"{prefix}:new",
                 style="success",
                 icon_custom_emoji_id="5870633910337015697"
             )
@@ -3811,7 +4204,8 @@ def make_resume_keyboard(page: int = 1) -> InlineKeyboardMarkup:
     
     keyboard_rows = []
     
-    active_id = get_active_session_id()
+    if active_id is None:
+        active_id = get_active_session_id()
 
     for sess in page_sessions:
         is_active = (sess["id"] == active_id)
@@ -3819,7 +4213,7 @@ def make_resume_keyboard(page: int = 1) -> InlineKeyboardMarkup:
         keyboard_rows.append([
             InlineKeyboardButton(
                 text=btn_text,
-                callback_data=f"res:sel:{sess['id']}",
+                callback_data=f"{prefix}:sel:{sess['id']}",
                 style="success" if is_active else "primary",
                 icon_custom_emoji_id="5958376256788502078" if is_active else "5870528606328852614"
             )
@@ -3829,31 +4223,31 @@ def make_resume_keyboard(page: int = 1) -> InlineKeyboardMarkup:
     if page > 1:
         nav_row.append(InlineKeyboardButton(
             text="Назад",
-            callback_data=f"res:pg:{page-1}",
+            callback_data=f"{prefix}:pg:{page-1}",
             style="primary",
             icon_custom_emoji_id="5255999157994297240"
         ))
     else:
-        nav_row.append(InlineKeyboardButton(text="⏹", callback_data="res:noop"))
+        nav_row.append(InlineKeyboardButton(text="⏹", callback_data=f"{prefix}:noop"))
         
-    nav_row.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="res:noop"))
+    nav_row.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data=f"{prefix}:noop"))
     
     if page < total_pages:
         nav_row.append(InlineKeyboardButton(
             text="Вперед",
-            callback_data=f"res:pg:{page+1}",
+            callback_data=f"{prefix}:pg:{page+1}",
             style="primary",
             icon_custom_emoji_id="5256039517801975973"
         ))
     else:
-        nav_row.append(InlineKeyboardButton(text="⏹", callback_data="res:noop"))
+        nav_row.append(InlineKeyboardButton(text="⏹", callback_data=f"{prefix}:noop"))
         
     keyboard_rows.append(nav_row)
     
     keyboard_rows.append([
         InlineKeyboardButton(
             text="Начать новую сессию",
-            callback_data="res:new",
+            callback_data=f"{prefix}:new",
             style="success",
             icon_custom_emoji_id="5870633910337015697"
         )
@@ -3862,7 +4256,7 @@ def make_resume_keyboard(page: int = 1) -> InlineKeyboardMarkup:
     keyboard_rows.append([
         InlineKeyboardButton(
             text="Отмена",
-            callback_data="res:cancel",
+            callback_data=f"{prefix}:cancel",
             style="danger",
             icon_custom_emoji_id="5870657884844462243"
         )
@@ -3893,6 +4287,9 @@ def has_auth() -> bool:
 
 @dp.message(Command("resume"))
 async def cmd_resume(msg: Message) -> None:
+    if (guest_uid := guest_cmd_sender(msg)):
+        await guest_cmd_resume(msg, guest_uid)
+        return
     gated = dm_command_gate(msg)
     if not gated:
         return
@@ -4044,9 +4441,11 @@ async def fetch_usage_data() -> dict:
 
 @dp.message(Command("usage"))
 async def cmd_usage(msg: Message) -> None:
-    gated = dm_command_gate(msg)
-    if not gated:
-        return
+    # Гость видит лимиты общего аккаунта владельца (его запуски идут под ним).
+    if not guest_cmd_sender(msg):
+        gated = dm_command_gate(msg)
+        if not gated:
+            return
 
     # Проверяем OAuth авторизацию (usage API требует OAuth, не работает с API-ключом)
     active_credentials = (USER_HOME / ".claude" / ".credentials.json")
@@ -4242,6 +4641,9 @@ async def cmd_delete_account(msg: Message) -> None:
 
 @dp.message(Command("goal"))
 async def cmd_goal(msg: Message) -> None:
+    if (guest_uid := guest_cmd_sender(msg)):
+        await guest_cmd_goal(msg, guest_uid)
+        return
     gated = dm_command_gate(msg)
     if not gated:
         return
@@ -4295,6 +4697,9 @@ async def on_goal_clear(cb: CallbackQuery) -> None:
 
 @dp.message(Command("restart"))
 async def cmd_restart(msg: Message) -> None:
+    if (guest_uid := guest_cmd_sender(msg)):
+        await guest_cmd_restart(msg, guest_uid)
+        return
     gated = dm_command_gate(msg)
     if not gated:
         return
@@ -4378,6 +4783,9 @@ async def on_limit_resume(cb: CallbackQuery) -> None:
 
 @dp.message(Command("close"))
 async def cmd_delete(msg: Message) -> None:
+    if (guest_uid := guest_cmd_sender(msg)):
+        await guest_new_session(msg, guest_uid)
+        return
     gated = dm_command_gate(msg)
     if not gated:
         return
@@ -4747,11 +5155,14 @@ async def main() -> None:
                     BotCommand(command="share", description="Выдать гостевой доступ (ID или @username)"),
                     BotCommand(command="unshare", description="Отозвать гостевой доступ"),
                     BotCommand(command="access", description="Кто имеет доступ к боту"),
-                    BotCommand(command="new", description="(гость) Начать новую сессию"),
-                    BotCommand(command="stop", description="(гость) Прервать текущий запуск"),
                 ],
                 scope=BotCommandScopeAllPrivateChats(),
             )
+            # Гостям — их собственный набор команд (scope их чата).
+            _access = load_access()
+            for _uid in _access["allowFrom"]:
+                if is_guest(_uid, _access):
+                    await set_guest_commands(_uid)
         except Exception as e:  # noqa: BLE001
             log(f"bot setup failed: {e}")
 
