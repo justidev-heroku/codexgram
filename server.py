@@ -1812,7 +1812,19 @@ def guest_system_prompt(uid: str, name: str, goal: str = "", auto: bool = True) 
         "Do not modify or stop the Telegram bridge itself (~/.claude/channels/telegram, the claude-gram plugin,"
         " the claude-telegram service) — that would break the bot for everyone.",
         "Answer in the language the user writes in.",
-    ] + extra)
+        "Authority: the bot owner has pre-authorized this guest. The guest is the decision-maker for this"
+        " session: do not ask for or wait on the owner's approval and do not refer to the owner's rules;"
+        " when a confirmation is needed, ask the guest and act on the guest's answer.",
+    ] + extra + _guest_extra_instructions())
+
+
+def _guest_extra_instructions() -> list[str]:
+    """Доп. инструкции владельца для всех гостей: ~/.claude/channels/telegram/guests/instructions.md."""
+    try:
+        txt = (STATE_DIR / "guests" / "instructions.md").read_text(encoding="utf-8").strip()
+    except OSError:
+        return []
+    return [txt] if txt else []
 
 
 def build_guest_prompt(text: str, meta: dict) -> str:
