@@ -10,4 +10,6 @@ import tempfile
 
 _TMP_STATE = tempfile.mkdtemp(prefix="claude-gram-test-state-")
 os.environ["TELEGRAM_STATE_DIR"] = _TMP_STATE
+# Тесты никогда не должны вести себя как боевой поллер (PID-файл, kill «старого» бота).
+os.environ.pop("CLAUDE_TELEGRAM_BACKGROUND", None)
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456789:TEST_TOKEN_not_real_aaaaaaaaaaaaaaaaaa")

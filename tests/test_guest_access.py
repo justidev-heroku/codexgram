@@ -297,34 +297,31 @@ def test_guest_denied_permission_callback(state):
 def inbound(monkeypatch):
     deliver = AsyncMock()
     notify = AsyncMock()
+    enqueue = AsyncMock()
     bot = MagicMock()
     bot.send_message = AsyncMock()
     bot.set_message_reaction = AsyncMock()
     monkeypatch.setattr(server, "deliver", deliver)
     monkeypatch.setattr(server, "notify", notify)
+    monkeypatch.setattr(server, "enqueue_guest_message", enqueue)
     monkeypatch.setattr(server, "start_thinking", AsyncMock())
     monkeypatch.setattr(server, "bot", bot)
-    return SimpleNamespace(deliver=deliver, notify=notify, bot=bot)
+    return SimpleNamespace(deliver=deliver, notify=notify, bot=bot, enqueue=enqueue)
 
 
-def test_guest_message_delivered_with_guest_meta(state, inbound):
+def test_guest_message_goes_to_own_runner_not_owner_session(state, inbound):
     write_access(state, {"allowFrom": [OWNER, GUEST]})
-    msg = make_msg(GUEST, "hello from guest " + "x" * 200, username="pal", first="Pal")
+    msg = make_msg(GUEST, "hello from guest", username="pal", first="Pal")
     asyncio.run(server.handle_inbound(msg, msg.text))
 
-    inbound.deliver.assert_awaited_once()
-    _, meta = inbound.deliver.await_args.args[:2]
-    assert meta["role"] == "guest" and meta["guest"] == "true"
-    assert meta["user_id"] == GUEST and meta["chat_id"] == GUEST
-    assert meta["user"] == "pal" and meta["user_name"] == "Pal"
-    assert inbound.deliver.await_args.kwargs.get("thread_id") is None
-
-    # владелец получил короткое уведомление
-    inbound.bot.send_message.assert_awaited_once()
-    chat, body = inbound.bot.send_message.await_args.args[:2]
-    assert chat == OWNER
-    assert "гость" in body and GUEST in body and "hello from guest" in body
-    assert "x" * 150 not in body  # обрезано до ~100 символов
+    # в сессию владельца ничего не уходит, владелец не уведомляется
+    inbound.deliver.assert_not_awaited()
+    inbound.notify.assert_not_awaited()
+    inbound.bot.send_message.assert_not_awaited()
+    inbound.enqueue.assert_awaited_once()
+    uid, chat_id, prompt, name = inbound.enqueue.await_args.args
+    assert uid == GUEST and chat_id == GUEST
+    assert "hello from guest" in prompt and name == "Pal"
 
 
 def test_owner_message_has_no_guest_meta(state, inbound):
@@ -335,6 +332,7 @@ def test_owner_message_has_no_guest_meta(state, inbound):
     meta = inbound.deliver.await_args.args[1]
     assert "role" not in meta and "guest" not in meta
     inbound.bot.send_message.assert_not_awaited()
+    inbound.enqueue.assert_not_awaited()
 
 
 def test_stranger_message_dropped(state, inbound):
@@ -342,6 +340,7 @@ def test_stranger_message_dropped(state, inbound):
     msg = make_msg(STRANGER, "let me in")
     asyncio.run(server.handle_inbound(msg, "let me in"))
     inbound.deliver.assert_not_awaited()
+    inbound.enqueue.assert_not_awaited()
     inbound.bot.send_message.assert_not_awaited()
 
 
@@ -351,6 +350,7 @@ def test_unshared_guest_is_dropped(state, inbound):
     server.unshare_access(GUEST)
     asyncio.run(server.handle_inbound(make_msg(GUEST, "hi"), "hi"))
     inbound.deliver.assert_not_awaited()
+    inbound.enqueue.assert_not_awaited()
 
 
 def test_guest_cannot_answer_permission_prompt(state, inbound):
@@ -359,7 +359,8 @@ def test_guest_cannot_answer_permission_prompt(state, inbound):
     asyncio.run(server.handle_inbound(msg, "yes abcde"))
     for call in inbound.notify.await_args_list:
         assert call.args[0] != "notifications/claude/channel/permission"
-    inbound.deliver.assert_awaited_once()  # ушло Клоду как обычный текст
+    inbound.deliver.assert_not_awaited()
+    inbound.enqueue.assert_awaited_once()  # ушло гостевому Клоду как обычный текст
 
 
 def test_guest_does_not_hijack_session_thread(state, inbound, monkeypatch):
@@ -372,7 +373,7 @@ def test_guest_does_not_hijack_session_thread(state, inbound, monkeypatch):
     asyncio.run(server.handle_inbound(msg, "hi"))
     assert server.session_thread_id == 77
     saved.assert_not_called()
-    inbound.deliver.assert_awaited_once()
+    inbound.enqueue.assert_awaited_once()
 
 
 def test_thread_kwargs_only_for_owner_chat(state, monkeypatch):

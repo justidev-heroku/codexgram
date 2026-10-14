@@ -1,5 +1,27 @@
 # DEVLOG
 
+## 2026-10-14 — Гости работают независимо от владельца
+
+- Сообщения гостей больше не инжектятся в сессию владельца и не дублируются
+  ему уведомлением «гость написал». Для каждого гостя `server.py` запускает
+  отдельный headless `claude -p --output-format stream-json` (первый раз
+  `--session-id <uuid>`, дальше `--resume`; id в
+  `~/.claude/channels/telegram/guests/<id>/session_id`), рабочий каталог
+  `~/guests/<id>` (env `CLAUDE_GRAM_GUESTS_DIR`), очередь — один запуск на гостя.
+- Без подтверждений: `--permission-mode bypassPermissions` + `IS_SANDBOX=1`.
+  Изоляция от моста: без `--channels`, `--strict-mcp-config --mcp-config
+  '{"mcpServers":{}}'`, плагин claude-gram выключен через `--settings`, из env
+  вычищены `CLAUDE_CODE_*`, `CLAUDECODE`, `CLAUDE_TELEGRAM_*`, `TELEGRAM_*` —
+  второго поллера (409) не возникает.
+- Модель: `CLAUDE_GRAM_GUEST_MODEL` > файл `guest_model` > `last_launched_model`.
+  Таймаут запуска `CLAUDE_GRAM_GUEST_TIMEOUT` (сек, по умолчанию 3600).
+- Гостю: статус-пузырь «⏳ работаю…» с последними действиями, финальный ответ
+  plain text чанками по 4096, строки `SEND_FILE: /abs/path` → файлы в чат.
+  Команды гостя: `/new` (новая сессия), `/stop` (kill текущего запуска + очистка
+  очереди). Владелец: `/access` показывает «сейчас работает», `/unshare` убивает
+  активный запуск гостя.
+- Тесты: `tests/test_guest_runner.py` (subprocess замокан, `os.killpg` подменён).
+
 ## 2026-07-25 — Установка на чистую машину и права на токены
 
 Шесть фиксов, из-за которых бот ломался при установке не на «эту» машину.
