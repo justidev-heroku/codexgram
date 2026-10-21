@@ -343,3 +343,76 @@ def test_startup_dialog_returns_fresh_list(wrapper):
 ])
 def test_startup_dialog_ordinary_output_is_none(wrapper, buf):
     assert wrapper.detect_startup_dialog(buf) is None
+
+
+# ---------- read_guest_bot_token / own_bot ----------
+
+VALID_TOKEN = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ_-abc"
+
+
+def _write_bot_env(state, content, newline="\n"):
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "bot.env").write_bytes(content.replace("\n", newline).encode("utf-8"))
+
+
+def test_read_guest_bot_token_no_file(wrapper, tmp_path):
+    assert wrapper.read_guest_bot_token(tmp_path / "nope") == ""
+
+
+def test_read_guest_bot_token_valid(wrapper, tmp_path):
+    _write_bot_env(tmp_path, f"TELEGRAM_BOT_TOKEN={VALID_TOKEN}\nBOT_ID=1\nBOT_USERNAME=x_bot\n")
+    assert wrapper.read_guest_bot_token(tmp_path) == VALID_TOKEN
+
+
+def test_read_guest_bot_token_crlf(wrapper, tmp_path):
+    _write_bot_env(tmp_path, f"TELEGRAM_BOT_TOKEN={VALID_TOKEN}\nBOT_ID=1\n", newline="\r\n")
+    assert wrapper.read_guest_bot_token(tmp_path) == VALID_TOKEN
+
+
+def test_read_guest_bot_token_strips_spaces(wrapper, tmp_path):
+    _write_bot_env(tmp_path, f"TELEGRAM_BOT_TOKEN=  {VALID_TOKEN}  \n")
+    assert wrapper.read_guest_bot_token(tmp_path) == VALID_TOKEN
+
+
+@pytest.mark.parametrize("content", [
+    "",
+    "BOT_ID=1\nBOT_USERNAME=x_bot\n",             # no token line
+    "TELEGRAM_BOT_TOKEN=\n",                      # empty value
+    "TELEGRAM_BOT_TOKEN=garbage\n",               # not a token
+    "TELEGRAM_BOT_TOKEN=123:short\n",             # too short tail
+    "TELEGRAM_BOT_TOKEN=abc:ABCDEFGHIJKLMNOPQRSTUVWXYZ\n",  # non-numeric id
+    "TELEGRAM_BOT_TOKEN=123456:ABC DEF GHI JKL MNO PQR\n",   # space inside
+])
+def test_read_guest_bot_token_rejects(wrapper, tmp_path, content):
+    _write_bot_env(tmp_path, content)
+    assert wrapper.read_guest_bot_token(tmp_path) == ""
+
+
+def test_read_guest_bot_token_unreadable_is_empty(wrapper, tmp_path):
+    (tmp_path / "bot.env").mkdir()  # a directory, read_text raises
+    assert wrapper.read_guest_bot_token(tmp_path) == ""
+
+
+def test_build_guest_launch_own_bot_sets_flag(wrapper, home):
+    state = home / "s"
+    cmd, env = wrapper.build_guest_launch(
+        "7", state, home, "", [], "", VALID_TOKEN, {}, own_bot=True)
+    assert env["CLAUDE_GRAM_GUEST_OWN_BOT"] == "1"
+    assert env["TELEGRAM_BOT_TOKEN"] == VALID_TOKEN
+
+
+def test_build_guest_launch_default_no_flag(wrapper, home):
+    state = home / "s"
+    cmd, env = wrapper.build_guest_launch("7", state, home, "", [], "", "1:T", {})
+    assert "CLAUDE_GRAM_GUEST_OWN_BOT" not in env
+    assert env["TELEGRAM_BOT_TOKEN"] == "1:T"
+
+
+def test_build_guest_launch_not_own_bot_pops_inherited_flag(wrapper, home):
+    state = home / "s"
+    base = {"CLAUDE_GRAM_GUEST_OWN_BOT": "1", "KEEP": "yes"}
+    cmd, env = wrapper.build_guest_launch("7", state, home, "", [], "", "1:T", base, own_bot=False)
+    assert "CLAUDE_GRAM_GUEST_OWN_BOT" not in env
+    assert env["KEEP"] == "yes"
+    assert env["TELEGRAM_BOT_TOKEN"] == "1:T"
+    assert base["CLAUDE_GRAM_GUEST_OWN_BOT"] == "1"  # input not mutated

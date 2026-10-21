@@ -1,5 +1,23 @@
 # DEVLOG
 
+## 2026-10-21 — Свой бот у гостя (Telegram Managed Bots)
+
+- Мастер (@ClaudeCodeExeBot, `can_manage_bots`) при /share и по /mybot шлёт гостю
+  reply-кнопку `request_managed_bot`. Гость создаёт своего бота в 2 тапа.
+- Апдейт `managed_bot` ловит `dp.update.outer_middleware` (`_managed_bot_mw`), потому что
+  aiogram 3.26 этого типа не знает (поле лежит в `model_extra`). Токен забирается
+  сырым `getManagedBotToken` и пишется в `guests/<uid>/bot.env` (0600). Затем
+  `systemctl restart claude-telegram-guest@<uid>`. Мастер поллит с
+  `allowed_updates` + `managed_bot`. aiogram НЕ обновляли: системный пакет общий с другими ботами.
+- Лаунчер: если в `bot.env` есть токен, гость стартует на нём с
+  `CLAUDE_GRAM_GUEST_OWN_BOT=1`. Такой экземпляр сам поллит свой бот (inbox.sock не
+  поднимает) и ставит себе меню. Без `bot.env` всё работает как раньше, через общий бот.
+- Гостю со своим ботом общий бот отвечает «пиши в @свой_бот» (не чаще раза в минуту),
+  а /mybot там предлагает пересоздать бота. `managed_bot_created` мастер гасит сам и не
+  пересылает в сокет перезапускающегося экземпляра. /unshare удаляет `bot.env`.
+- Тесты: `tests/test_managed_bots.py`, `tests/test_install_guest.py`. 287 passed,
+  4 старых падения /usage.
+
 ## 2026-10-21 — Гость = полноценный отдельный экземпляр Claude
 
 - Headless-раннер (`claude -p` на каждое сообщение) удалён целиком. Каждый гость

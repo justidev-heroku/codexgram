@@ -360,8 +360,21 @@ def _use_state_dir(state_dir) -> None:
     LAST_MODEL_FILE = STATE_DIR / "last_launched_model"
     SESSION_LIMIT_FILE = STATE_DIR / "last_session_limit"
 
+def read_guest_bot_token(state_dir) -> str:
+    # Guest's own bot (Managed Bots) from <state_dir>/bot.env. "" if absent or malformed.
+    try:
+        path = Path(state_dir) / "bot.env"
+        if path.exists():
+            for line in path.read_text("utf-8").splitlines():
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    token = line.split("=", 1)[1].strip()
+                    return token if re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{20,}", token) else ""
+    except Exception:
+        pass
+    return ""
+
 def read_bot_token() -> str:
-    # Token always comes from the owner's .env, also for guest instances.
+    # Owner's token from OWNER_STATE_DIR/.env. Used for guests only when they have no own bot.
     env_path = OWNER_STATE_DIR / ".env"
     try:
         if env_path.exists():
@@ -397,7 +410,7 @@ def build_guest_system_prompt(uid, work_dir, instructions_text) -> str:
         parts.append(instructions_text.strip())
     return "\n\n".join(parts)
 
-def build_guest_launch(uid, state_dir, work_dir, model_val, session_args, instructions_text, token, base_env):
+def build_guest_launch(uid, state_dir, work_dir, model_val, session_args, instructions_text, token, base_env, own_bot=False):
     # Pure: returns (cmd, env) for a guest claude process.
     state_dir = Path(state_dir)
     settings_file = state_dir / "settings.json"
@@ -410,6 +423,10 @@ def build_guest_launch(uid, state_dir, work_dir, model_val, session_args, instru
     env["CLAUDE_GRAM_SETTINGS_FILE"] = str(settings_file)
     if token:
         env["TELEGRAM_BOT_TOKEN"] = token
+    if own_bot:
+        env["CLAUDE_GRAM_GUEST_OWN_BOT"] = "1"
+    else:
+        env.pop("CLAUDE_GRAM_GUEST_OWN_BOT", None)
     cmd = ["claude", "--channels", "plugin:claude-gram@justidev-marketplace",
            "--settings", str(settings_file)]
     if model_val:
@@ -728,11 +745,13 @@ def main() -> int:
         if cli == "agy" or not has_creds:
             sys.stderr.write("Guest instance: no active Claude credentials. Exiting.\n")
             return 1
-        token = read_bot_token()
+        state_dir, work_dir = guest_paths(str(HOME_DIR), guest_uid, os.environ.get("CLAUDE_GRAM_GUESTS_DIR"))
+        own_token = read_guest_bot_token(state_dir)
+        token = own_token or read_bot_token()
+        own_bot = bool(own_token)
         if not token:
             sys.stderr.write("Guest instance: TELEGRAM_BOT_TOKEN missing in owner .env. Exiting.\n")
             return 1
-        state_dir, work_dir = guest_paths(str(HOME_DIR), guest_uid, os.environ.get("CLAUDE_GRAM_GUESTS_DIR"))
         _use_state_dir(state_dir)
         try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -784,7 +803,7 @@ def main() -> int:
     if guest_uid is not None:
         cmd, env = build_guest_launch(
             guest_uid, STATE_DIR, work_dir, model_val, session_args,
-            read_guest_instructions(), token, dict(os.environ))
+            read_guest_instructions(), token, dict(os.environ), own_bot=own_bot)
         os.environ.clear()
         os.environ.update(env)
     else:

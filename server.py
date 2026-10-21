@@ -60,9 +60,12 @@ from aiogram.types import (
     InputMediaAudio,
     InputMediaDocument,
     InputMediaPhoto,
+    KeyboardButton,
     Message,
     ReactionTypeCustomEmoji,
     ReactionTypeEmoji,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     ReplyParameters,
 )
 
@@ -1704,6 +1707,7 @@ OWNER_BOT_COMMANDS = [
     ("share", "Выдать гостевой доступ (ID или @username)"),
     ("unshare", "Отозвать гостевой доступ"),
     ("access", "Кто имеет доступ к боту"),
+    ("mybot", "Создать своего бота"),
 ]
 # Меню гостя: команды владельца минус те, что гостевой экземпляр не выполняет.
 GUEST_BOT_COMMANDS = [(c, d) for c, d in OWNER_BOT_COMMANDS if c not in GUEST_BLOCKED_COMMANDS]
@@ -1722,6 +1726,217 @@ def guest_work_dir(uid: str) -> Path:
 
 def guest_socket_path(uid: str) -> Path:
     return guest_state_dir(uid) / GUEST_SOCKET_NAME
+
+
+# ---------------------------------------------------------------------------
+# Свой бот гостя (Telegram Managed Bots, Bot API 9.6).
+#
+# Гость создаёт бота кнопкой request_managed_bot. Мастер получает апдейт managed_bot,
+# забирает токен через getManagedBotToken, кладёт его в bot.env гостя (0600) и
+# перезапускает экземпляр гостя: тот поднимается уже на своём боте
+# (CLAUDE_GRAM_GUEST_OWN_BOT=1, TELEGRAM_BOT_TOKEN из bot.env).
+# ---------------------------------------------------------------------------
+
+GUEST_OWN_BOT = IS_GUEST_INSTANCE and os.environ.get("CLAUDE_GRAM_GUEST_OWN_BOT") == "1"
+GUEST_BOT_ENV_NAME = "bot.env"
+GUEST_BOT_HINT_INTERVAL = 60.0  # секунд между подсказками «у тебя свой бот» одному гостю
+MANAGED_BOT_REQUEST_ID = 1
+MANAGED_BOT_BUTTON_TEXT = "🤖 Создать своего бота"
+MANAGED_BOT_ERROR_TEXT = "⚠️ Не удалось подключить бота, попробуй /mybot ещё раз"
+MANAGED_BOT_CREATED_TEXT = "Бот создан, подключаю…"
+MANAGED_BOT_OFFER_TEXT = (
+    "🎉 Тебе выдан доступ к Claude. Можешь писать здесь, а можешь создать своего бота "
+    "(2 тапа) — тогда у тебя будет отдельный чат."
+)
+_guest_bot_hint_at: dict[str, float] = {}
+
+
+def guest_bot_env_path(uid) -> Path:
+    return guest_state_dir(str(uid)) / GUEST_BOT_ENV_NAME
+
+
+def save_guest_bot(uid, token: str, bot_id, username: str | None) -> None:
+    """Атомарно пишет bot.env гостя (0600). Токен в лог не выводится."""
+    token = (token or "").strip()
+    if not token or "\n" in token or "\r" in token:
+        raise ValueError("empty or malformed bot token")
+    path = guest_bot_env_path(uid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = (
+        f"TELEGRAM_BOT_TOKEN={token}\n"
+        f"BOT_ID={bot_id}\n"
+        f"BOT_USERNAME={(username or '').lstrip('@')}\n"
+    )
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
+        f.write(body)
+    tmp.replace(path)
+
+
+def load_guest_bot(uid) -> dict | None:
+    """{'token', 'bot_id', 'username'} или None, если файла нет или в нём нет токена."""
+    try:
+        raw = guest_bot_env_path(uid).read_text("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    values: dict[str, str] = {}
+    for line in raw.splitlines():
+        m = re.match(r"^([A-Z_]+)=(.*)$", line.strip())
+        if m:
+            values[m.group(1)] = m.group(2).strip()
+    token = values.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        return None
+    return {
+        "token": token,
+        "bot_id": values.get("BOT_ID", ""),
+        "username": values.get("BOT_USERNAME", ""),
+    }
+
+
+def remove_guest_bot(uid) -> None:
+    path = guest_bot_env_path(uid)
+    path.unlink(missing_ok=True)
+    path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+
+
+async def get_managed_bot_token(bot_id: int) -> str:
+    """Сырой вызов getManagedBotToken. Ошибки переписываем без URL (в нём токен бота)."""
+    url = f"https://api.telegram.org/bot{TOKEN}/getManagedBotToken"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.post(url, json={"user_id": int(bot_id)}) as resp:
+                data = await resp.json(content_type=None)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"getManagedBotToken: {type(e).__name__}") from None
+    if not isinstance(data, dict) or not data.get("ok"):
+        desc = str(data.get("description") if isinstance(data, dict) else "")[:200]
+        raise RuntimeError(f"getManagedBotToken: API error {desc}")
+    token = data.get("result")
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("getManagedBotToken: empty token")
+    return token.strip()
+
+
+def _field(obj, name: str):
+    """Поле из объекта aiogram, из model_extra или из dict (managed_bot приходит dict-ом)."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    val = getattr(obj, name, None)
+    if val is None:
+        val = (getattr(obj, "model_extra", None) or {}).get(name)
+    return val
+
+
+def _extra(obj, name: str):
+    """Нестандартное поле апдейта/сообщения (managed_bot, managed_bot_created) из model_extra."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    extras = getattr(obj, "model_extra", None)
+    return extras.get(name) if isinstance(extras, dict) else None
+
+
+def managed_bot_keyboard(first_name: str | None) -> ReplyKeyboardMarkup:
+    name = (first_name or "").strip()
+    suggested = f"Claude {name}" if name else "Claude"
+    button = KeyboardButton(
+        text=MANAGED_BOT_BUTTON_TEXT,
+        request_managed_bot={"request_id": MANAGED_BOT_REQUEST_ID, "suggested_name": suggested[:64]},
+    )
+    return ReplyKeyboardMarkup(keyboard=[[button]], resize_keyboard=True, one_time_keyboard=True)
+
+
+async def _handle_managed_bot(mb) -> None:
+    creator = str(_field(_field(mb, "user"), "id") or "")
+    bot_info = _field(mb, "bot")
+    bot_id = str(_field(bot_info, "id") or "")
+    username = str(_field(bot_info, "username") or "").lstrip("@")
+    if not creator.isdigit() or not bot_id.isdigit():
+        log("managed bot update without valid user/bot ids: ignored")
+        return
+    if not is_guest(creator):
+        log(f"managed bot {bot_id} created by {creator} (not a guest): token not saved")
+        return
+    try:
+        token = await get_managed_bot_token(int(bot_id))
+        save_guest_bot(creator, token, bot_id, username)
+    except Exception as e:  # noqa: BLE001
+        log(f"guest {creator}: managed bot setup failed: {e}")
+        await _safe_send(creator, MANAGED_BOT_ERROR_TEXT)
+        return
+    if username:
+        greeting = (
+            f"🤖 Твой бот @{_esc(username)} готов. Дальше пиши туда: t.me/{_esc(username)}. "
+            "Через ~минуту там будет твоя сессия Claude"
+        )
+    else:
+        greeting = "🤖 Твой бот готов. Дальше пиши ему в Telegram. Через ~минуту там будет твоя сессия Claude"
+    try:
+        await bot.send_message(int(creator), greeting, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    except Exception as e:  # noqa: BLE001
+        log(f"guest {creator}: greeting failed: {type(e).__name__}")
+    try:
+        prepare_guest_state(creator)
+        # Топик старого чата (общий бот) в чате своего бота не существует.
+        (guest_state_dir(creator) / THREAD_FILE.name).unlink(missing_ok=True)
+    except OSError as e:
+        log(f"guest {creator}: prepare state failed: {e}")
+    await _systemctl("restart", "--no-block", GUEST_UNIT.format(uid=creator))
+    log(f"guest {creator}: own bot {bot_id} connected, instance restarting")
+
+
+async def _managed_bot_mw(handler, update, data):
+    """Мастер: апдейт managed_bot (гость создал или пересоздал своего бота). Дальше не передаём."""
+    mb = _extra(update, "managed_bot")
+    if mb is None:
+        return await handler(update, data)
+    try:
+        await _handle_managed_bot(mb)
+    except Exception as e:  # noqa: BLE001
+        log(f"managed bot update failed: {type(e).__name__}")
+    return None
+
+
+def _own_bot_hint_due(uid: str) -> bool:
+    now = time.monotonic()
+    last = _guest_bot_hint_at.get(uid)
+    if last is not None and now - last < GUEST_BOT_HINT_INTERVAL:
+        return False
+    _guest_bot_hint_at[uid] = now
+    return True
+
+
+async def _send_recreate_offer(uid: str, own: dict, update) -> None:
+    """/mybot гостя с собственным ботом: отвечает мастер, в экземпляр гостя не пересылаем."""
+    user = extract_update_user(update)
+    username = own.get("username") or ""
+    where = f"@{username}" if username else "свой бот"
+    text = f"Нажми кнопку ниже, чтобы пересоздать бота. Сейчас твой бот: {where}"
+    try:
+        await bot.send_message(int(uid), text,
+                               reply_markup=managed_bot_keyboard(getattr(user, "first_name", None)))
+    except Exception as e:  # noqa: BLE001
+        log(f"guest {uid}: recreate offer failed: {type(e).__name__}")
+
+
+async def _hint_own_bot(uid: str, own: dict, update) -> None:
+    """Апдейт гостя с собственным ботом в общем боте: подсказываем адрес, остальное молча гасим."""
+    if getattr(update, "message", None) is None and getattr(update, "callback_query", None) is None:
+        return
+    if not _own_bot_hint_due(uid):
+        return
+    username = own.get("username") or ""
+    where = f"@{username}" if username else "свой бот"
+    await _safe_send(uid, f"👉 У тебя теперь свой бот: {where} — пиши туда.")
+
+
+def _master_allowed_updates() -> list[str]:
+    """Типы апдейтов мастера: используемые хэндлерами + managed_bot (его нет среди хэндлеров)."""
+    return sorted(set(dp.resolve_used_update_types()) | {"managed_bot"})
 
 
 _UPDATE_EVENT_FIELDS = (
@@ -1774,6 +1989,17 @@ async def _guest_router_mw(handler, update, data):
         remember_user(extract_update_user(update))
     except Exception as e:  # noqa: BLE001
         log(f"remember_user failed: {e}")
+    msg = getattr(update, "message", None)
+    if msg is not None and _extra(msg, "managed_bot_created") is not None:
+        # Приветствие шлёт _handle_managed_bot; экземпляр гостя в этот момент перезапускается.
+        return None
+    own = load_guest_bot(uid)
+    if own is not None:
+        if msg is not None and command_name(msg.text) == "mybot":
+            await _send_recreate_offer(uid, own, update)
+        else:
+            await _hint_own_bot(uid, own, update)
+        return None
     try:
         await forward_to_guest(uid, update_to_raw(update))
     except Exception as e:  # noqa: BLE001
@@ -1784,6 +2010,12 @@ async def _guest_router_mw(handler, update, data):
 
 async def _guest_instance_block_mw(handler, msg, data):
     """Гостевой экземпляр: команды аккаунтов/логина/шаринга недоступны."""
+    if _extra(msg, "managed_bot_created") is not None:
+        try:
+            await msg.answer(MANAGED_BOT_CREATED_TEXT)
+        except Exception as e:  # noqa: BLE001
+            log(f"managed bot created answer failed: {type(e).__name__}")
+        return None
     if command_name(getattr(msg, "text", None)) in GUEST_BLOCKED_COMMANDS:
         try:
             await msg.answer(GUEST_BLOCKED_TEXT)
@@ -2467,7 +2699,8 @@ dp.callback_query.outer_middleware(_remember_users_mw)
 if IS_GUEST_INSTANCE:
     dp.message.outer_middleware(_guest_instance_block_mw)
 elif os.environ.get("CLAUDE_TELEGRAM_BACKGROUND") == "1":
-    # Мастер: апдейты гостей уходят в их экземпляры (см. _guest_router_mw).
+    # Мастер: managed_bot (свой бот гостя) и апдейты гостей уходят в их экземпляры.
+    dp.update.outer_middleware(_managed_bot_mw)
     dp.update.outer_middleware(_guest_router_mw)
 
 
@@ -2573,6 +2806,7 @@ async def cmd_share(msg: Message) -> None:
         for uid in set(load_access()["allowFrom"]) - before:
             await ensure_guest_running(uid)
             await set_guest_commands(uid)
+            await _send_managed_bot_offer(uid)
 
 
 @dp.message(Command("unshare"))
@@ -2586,6 +2820,31 @@ async def cmd_unshare(msg: Message) -> None:
         for uid in before - set(load_access()["allowFrom"]):
             await stop_guest_instance(uid)
             await clear_guest_commands(uid)
+            remove_guest_bot(uid)
+
+
+async def _send_managed_bot_offer(uid: str) -> None:
+    name = (load_known_users().get(str(uid)) or {}).get("name") or ""
+    first = name.split()[0] if name.split() else ""
+    try:
+        await bot.send_message(int(uid), MANAGED_BOT_OFFER_TEXT, reply_markup=managed_bot_keyboard(first))
+    except Exception as e:  # noqa: BLE001
+        log(f"guest {uid}: managed bot offer failed: {type(e).__name__}")
+
+
+@dp.message(Command("mybot"))
+async def cmd_mybot(msg: Message) -> None:
+    if not dm_command_gate(msg):
+        return
+    if GUEST_OWN_BOT:
+        await msg.answer(f"У тебя уже свой бот @{bot_username or ''}")
+        return
+    first = msg.from_user.first_name if msg.from_user else None
+    text = ("Нажми кнопку ниже: Telegram создаст отдельного бота (2 тапа). "
+            "Он станет твоим личным чатом с Claude.")
+    if msg.from_user and is_owner(msg.from_user.id):
+        text += "\n<i>Для владельца бот не подключается: токен не сохраняется.</i>"
+    await msg.answer(text, parse_mode="HTML", reply_markup=managed_bot_keyboard(first))
 
 
 @dp.message(Command("access"))
@@ -4577,7 +4836,12 @@ async def main() -> None:
             me = await bot.get_me()
             bot_username = me.username or ""
             log(f"polling as @{bot_username}")
-            if not IS_GUEST_INSTANCE:  # меню ставит только мастер
+            if GUEST_OWN_BOT:  # свой бот гостя: меню ставит сам экземпляр
+                await bot.set_my_commands(
+                    [BotCommand(command=c, description=d) for c, d in GUEST_BOT_COMMANDS],
+                    scope=BotCommandScopeAllPrivateChats(),
+                )
+            elif not IS_GUEST_INSTANCE:  # меню ставит только мастер
                 await bot.set_my_commands(
                     [BotCommand(command=c, description=d) for c, d in OWNER_BOT_COMMANDS],
                     scope=BotCommandScopeAllPrivateChats(),
@@ -4712,11 +4976,15 @@ async def main() -> None:
 
     if os.environ.get("CLAUDE_TELEGRAM_BACKGROUND") == "1":
         topic_task = asyncio.create_task(delayed_topic())
-        if IS_GUEST_INSTANCE:
-            # Гостевой экземпляр не поллит Telegram: апдейты приходят от мастера через сокет.
+        if IS_GUEST_INSTANCE and not GUEST_OWN_BOT:
+            # Гостевой экземпляр на общем боте не поллит Telegram: апдейты приходят от мастера через сокет.
             inbox_server = await start_guest_inbox(dp, bot)
-        else:
+        elif GUEST_OWN_BOT:
+            # Свой бот гостя: поллим сами; цикл автообновления и usage здесь не нужны.
             polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
+        else:
+            polling_task = asyncio.create_task(
+                dp.start_polling(bot, handle_signals=False, allowed_updates=_master_allowed_updates()))
             update_task = asyncio.create_task(auto_update_loop(shutdown_evt, bot))
             usage_watch_task = asyncio.create_task(usage_watch_loop(shutdown_evt, bot))
 
