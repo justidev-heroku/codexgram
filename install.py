@@ -687,6 +687,32 @@ def clean_mcp_auth_cache() -> None:
         pass
 
 
+# Interactive startup dialogs that can block a fresh claude process on the PTY.
+# needle: lowercase, whitespace-free text as it appears after ANSI cleanup.
+# keys: byte chunks written to the PTY in order, STARTUP_DIALOG_KEY_DELAY apart.
+STARTUP_DIALOGS = [
+    # "Make auto mode your default permission mode?" -> "No, keep bypass permissions"
+    ("makeautomodeyourdefaultpermissionmode?", [b"\x1b[B", b"\r"]),
+]
+STARTUP_DIALOG_COOLDOWN = 5.0
+STARTUP_DIALOG_MAX_ANSWERS = 5
+STARTUP_DIALOG_KEY_DELAY = 0.3
+
+
+def _match_startup_dialog(buf: str):
+    norm = re.sub(r"\s+", "", buf).lower()
+    for needle, keys in STARTUP_DIALOGS:
+        if needle in norm:
+            return needle, keys
+    return None
+
+
+def detect_startup_dialog(buf: str):
+    # Key chunks answering a known startup dialog found in buf, else None.
+    hit = _match_startup_dialog(buf)
+    return list(hit[1]) if hit else None
+
+
 def main() -> int:
     guest_uid = parse_args(sys.argv[1:])
     os.environ["CLAUDE_TELEGRAM_BACKGROUND"] = "1"
@@ -795,6 +821,8 @@ def main() -> int:
         r'claude --resume ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
     )
     pty_buffer = ""
+    startup_dialog_counts = {}
+    startup_dialog_last = {}
     last_alert_time = 0.0
     auth_failed = False
     process_start_time = time.time()
@@ -836,6 +864,24 @@ def main() -> int:
             pty_buffer += clean_data
             if len(pty_buffer) > 10000:
                 pty_buffer = pty_buffer[-10000:]
+
+            hit = _match_startup_dialog(pty_buffer)
+            if hit:
+                dialog_needle, dialog_keys = hit
+                dlg_now = time.time()
+                if (startup_dialog_counts.get(dialog_needle, 0) < STARTUP_DIALOG_MAX_ANSWERS
+                        and dlg_now - startup_dialog_last.get(dialog_needle, 0.0) > STARTUP_DIALOG_COOLDOWN):
+                    try:
+                        for chunk in dialog_keys:
+                            os.write(fd, chunk)
+                            time.sleep(STARTUP_DIALOG_KEY_DELAY)
+                    except OSError:
+                        pass
+                    startup_dialog_counts[dialog_needle] = startup_dialog_counts.get(dialog_needle, 0) + 1
+                    startup_dialog_last[dialog_needle] = dlg_now
+                    sys.stderr.write(f"auto-answered startup dialog: {dialog_needle}\n")
+                    sys.stderr.flush()
+                    pty_buffer = ""
 
             if not forked_session_captured:
                 m = resume_hint_re.search(pty_buffer)

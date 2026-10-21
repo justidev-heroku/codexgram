@@ -302,3 +302,44 @@ def test_render_guest_unit_contract():
     assert "User=litteraly" in text
     assert "After=network-online.target claude-telegram.service" in text
     assert "Environment=CLAUDE_ALLOW_ROOT=1" in text
+
+
+# ---------- detect_startup_dialog ----------
+
+AUTO_MODE_KEYS = [b"\x1b[B", b"\r"]
+
+
+def test_startup_dialog_with_spaces(wrapper):
+    buf = ("Make auto mode your default permission mode?\n"
+           "❯ Yes, set auto mode as my default permission mode\n"
+           "  No, keep bypass permissions")
+    assert wrapper.detect_startup_dialog(buf) == AUTO_MODE_KEYS
+
+
+def test_startup_dialog_without_spaces_after_ansi_strip(wrapper):
+    assert wrapper.detect_startup_dialog("Makeautomodeyourdefaultpermissionmode?") == AUTO_MODE_KEYS
+
+
+def test_startup_dialog_with_noise_around(wrapper):
+    buf = ("\x1b[2Jjunk ### Make  auto\tmode your default\n permission mode? ❯ Yes  ...tail\r\n")
+    assert wrapper.detect_startup_dialog(buf) == AUTO_MODE_KEYS
+
+
+def test_startup_dialog_case_insensitive(wrapper):
+    assert wrapper.detect_startup_dialog("MAKE AUTO MODE YOUR DEFAULT PERMISSION MODE?") == AUTO_MODE_KEYS
+
+
+def test_startup_dialog_returns_fresh_list(wrapper):
+    a = wrapper.detect_startup_dialog("makeautomodeyourdefaultpermissionmode?")
+    a.append(b"x")
+    assert wrapper.detect_startup_dialog("makeautomodeyourdefaultpermissionmode?") == AUTO_MODE_KEYS
+
+
+@pytest.mark.parametrize("buf", [
+    "",
+    "normal claude output ❯ ",
+    "Make auto mode your default",  # incomplete question, no match
+    "permission mode? keep bypass permissions",
+])
+def test_startup_dialog_ordinary_output_is_none(wrapper, buf):
+    assert wrapper.detect_startup_dialog(buf) is None
