@@ -1755,6 +1755,16 @@ def command_name(text: str) -> str | None:
     return m.group(1).lower() if m else None
 
 
+GUEST_DELIVERY_FAILED_TEXT = "⚠️ Не удалось доставить сообщение в твою сессию Claude. Попробуй отправить ещё раз."
+
+
+def update_to_raw(update) -> dict:
+    """Апдейт -> JSON-словарь для сокета гостя.
+    exclude_defaults отбрасывает подставленные aiogram значения Default (например,
+    link_preview_options.is_disabled у сообщений со ссылками), иначе orjson падает."""
+    return update.model_dump(mode="json", by_alias=True, exclude_none=True, exclude_defaults=True)
+
+
 async def _guest_router_mw(handler, update, data):
     """Мастер: апдейты гостей уходят в их экземпляр, владельческие хэндлеры их не видят."""
     uid = guest_uid_of_update(update)
@@ -1765,9 +1775,10 @@ async def _guest_router_mw(handler, update, data):
     except Exception as e:  # noqa: BLE001
         log(f"remember_user failed: {e}")
     try:
-        await forward_to_guest(uid, update.model_dump(mode="json", by_alias=True, exclude_none=True))
+        await forward_to_guest(uid, update_to_raw(update))
     except Exception as e:  # noqa: BLE001
         log(f"forward to guest {uid} failed: {e}")
+        await _safe_send(uid, GUEST_DELIVERY_FAILED_TEXT)
     return None
 
 

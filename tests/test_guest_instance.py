@@ -544,3 +544,78 @@ def test_failed_share_does_not_start_instance(share_env):
     asyncio.run(server.cmd_share(_share_msg(f"/share {OWNER}")))
     server.ensure_guest_running.assert_not_awaited()
     share_env.set_my_commands.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------- update_to_raw / delivery
+
+
+def test_update_to_raw_link_preview_roundtrip():
+    upd = Update.model_validate({"update_id": 1, "message": {
+        "message_id": 5, "date": 1700000000, "chat": {"id": 7, "type": "private"},
+        "from": {"id": 7, "is_bot": False, "first_name": "a"},
+        "text": "hi https://x.com", "link_preview_options": {"url": "https://x.com"}}})
+    raw = server.update_to_raw(upd)
+    assert orjson.dumps(raw)  # не падает на сериализацию
+    assert "from" in raw["message"]
+    back = Update.model_validate(orjson.loads(orjson.dumps(raw)))
+    assert back.message.text == "hi https://x.com"
+    assert back.message.from_user.is_bot is False
+    assert int(back.message.date.timestamp()) == 1700000000
+
+
+def test_update_to_raw_callback_query_roundtrip():
+    upd = make_update("callback_query", int(GUEST))
+    raw = orjson.loads(orjson.dumps(server.update_to_raw(upd)))
+    assert "from" in raw["callback_query"]
+    back = Update.model_validate(raw)
+    assert back.callback_query.data == "close"
+    assert back.callback_query.from_user.id == int(GUEST)
+
+
+def test_update_to_raw_entities_expandable_blockquote_roundtrip():
+    text = "quote line\nmore"
+    upd = Update.model_validate({"update_id": 2, "message": {
+        "message_id": 6, "date": 1700000000, "chat": {"id": 7, "type": "private"},
+        "from": {"id": 7, "is_bot": False, "first_name": "a"},
+        "text": text,
+        "entities": [{"type": "expandable_blockquote", "offset": 0, "length": len(text)}]}})
+    raw = orjson.loads(orjson.dumps(server.update_to_raw(upd)))
+    assert raw["message"]["entities"][0]["type"] == "expandable_blockquote"
+    back = Update.model_validate(raw)
+    assert back.message.entities[0].type == "expandable_blockquote"
+    assert back.message.entities[0].length == len(text)
+    assert back.message.text == text
+
+
+def test_router_serialization_failure_notifies_guest(gstate, monkeypatch):
+    _write_access(gstate, {"allowFrom": [OWNER, GUEST]})
+
+    def boom(update):
+        raise TypeError("Unable to serialize unknown type")
+
+    monkeypatch.setattr(server, "update_to_raw", boom)
+    fwd = AsyncMock()
+    monkeypatch.setattr(server, "forward_to_guest", fwd)
+    safe_send = AsyncMock()
+    monkeypatch.setattr(server, "_safe_send", safe_send)
+    handler = AsyncMock(return_value="owner")
+    result = asyncio.run(server._guest_router_mw(handler, make_update("message", int(GUEST)), {}))
+    assert result is None
+    handler.assert_not_awaited()
+    fwd.assert_not_awaited()
+    safe_send.assert_awaited_once()
+    uid, text = safe_send.await_args.args
+    assert uid == GUEST
+    assert "Не удалось доставить" in text
+
+
+def test_router_forward_failure_notifies_guest(gstate, monkeypatch):
+    _write_access(gstate, {"allowFrom": [OWNER, GUEST]})
+    monkeypatch.setattr(server, "forward_to_guest", AsyncMock(side_effect=OSError("socket gone")))
+    safe_send = AsyncMock()
+    monkeypatch.setattr(server, "_safe_send", safe_send)
+    handler = AsyncMock()
+    asyncio.run(server._guest_router_mw(handler, make_update("message", int(GUEST)), {}))
+    handler.assert_not_awaited()
+    safe_send.assert_awaited_once()
+    assert "Не удалось доставить" in safe_send.await_args.args[1]
