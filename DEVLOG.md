@@ -1,5 +1,30 @@
 # DEVLOG
 
+## 2026-10-21 — Гость = полноценный отдельный экземпляр Claude
+
+- Headless-раннер (`claude -p` на каждое сообщение) удалён целиком. Каждый гость
+  теперь — постоянный `claude --channels plugin:claude-gram` под лаунчером
+  `claude-telegram-bot --guest <uid>` в systemd-юните `claude-telegram-guest@<uid>`.
+- Telegram по-прежнему поллит только мастер (владельческий `server.py`). Апдейты
+  гостей (сообщения, кнопки, реакции) outer-middleware на `dp.update` пересылает
+  сырым JSON в `guests/<uid>/inbox.sock`; гостевой `server.py` (`CLAUDE_GRAM_GUEST_UID`)
+  не поллит, а слушает сокет и делает `dp.feed_raw_update`. Если экземпляр не поднят —
+  мастер будит юнит, сообщения буферизуются по порядку (до 120 с).
+- В экземпляре гость — «владелец» своего `access.json`, поэтому дизайн и команды
+  те же, что у владельца. Заблокированы: /share /unshare /access /check_update
+  /mcp_debug и все аккаунтные (/login /logout /accounts /save_account /switch_account
+  /delete_account) — аккаунт общий.
+- Модель/effort гостя — в `guests/<uid>/settings.json` (`CLAUDE_GRAM_SETTINGS_FILE`,
+  `--settings`), глобальный settings.json владельца не трогается. Сессии — в
+  `~/.claude/projects/<slug ~/guests/<uid>>/` (`project_sessions_dir()` вместо `-root`).
+- Миграция: старые файлы `guests/<uid>/{session_id,model,effort,auto,goal}` переносятся
+  в settings.json/session_goal.txt и удаляются; сессия гостя сбрасывается.
+- `install.py`: шаблон лаунчера вынесен в `WRAPPER_TEMPLATE` + `render_wrapper()`,
+  все пути состояния от `STATE_DIR`, `ensure_trusted()` для рабочего каталога,
+  генерация `claude-telegram-guest@.service` (`render_guest_unit()`).
+- Тесты: `tests/test_guest_instance.py`, `tests/test_install_guest.py`; старые
+  `test_guest_runner.py`/`test_guest_commands.py` удалены.
+
 ## 2026-10-14 — Гостевые версии команд
 
 - Гостю доступны свои `/model`, `/effort`, `/auto`, `/resume`, `/goal`, `/close`

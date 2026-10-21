@@ -108,8 +108,8 @@ def test_resolve_claude_bin_bare_name_when_nothing_found():
 
 def test_wrapper_imports_shutil():
     src = INSTALL_PY.read_text("utf-8")
-    wrapper = re.search(r'wrapper_code = r"""(.*?)"""', src, re.S)
-    assert wrapper, "wrapper_code literal not found"
+    wrapper = re.search(r'WRAPPER_TEMPLATE = r"""(.*?)"""', src, re.S)
+    assert wrapper, "WRAPPER_TEMPLATE literal not found"
     assert re.search(r"^import shutil$", wrapper.group(1), re.M)
 
 

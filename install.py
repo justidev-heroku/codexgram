@@ -301,118 +301,9 @@ def ensure_login_user() -> None:
         )
 
 
-def main():
-    print_banner()
-    start_mascot_animation()
-    time.sleep(2.5)  # маскот покачивается пару секунд
-    stop_mascot_animation()
-    print_claudgramik()  # статичный маскот остаётся на экране
-    
-    # 1. Интерактивный опрос / Автоопределение
-    print(f"{CLR_CYAN}[1/5] Настройка Telegram конфигурации:{CLR_RESET}")
-    
-    HOME_DIR = Path.home()
-    STATE_DIR = HOME_DIR / ".claude" / "channels" / "telegram"
-    existing_token = None
-    existing_owner = None
-    
-    # Пытаемся прочитать существующие настройки
-    try:
-        import json
-        env_file = STATE_DIR / ".env"
-        if env_file.exists():
-            for line in env_file.read_text("utf-8").splitlines():
-                if line.startswith("TELEGRAM_BOT_TOKEN="):
-                    t = line.split("=", 1)[1].strip()
-                    if re.match(r"^[0-9]+:[a-zA-Z0-9_-]+$", t):
-                        existing_token = t
-                        break
-    except Exception:
-        pass
-        
-    try:
-        import json
-        access_file = STATE_DIR / "access.json"
-        if access_file.exists():
-            data = json.loads(access_file.read_text("utf-8"))
-            if data.get("allowFrom") and isinstance(data["allowFrom"], list) and len(data["allowFrom"]) > 0:
-                o = str(data["allowFrom"][0]).strip()
-                if re.match(r"^[0-9]+$", o):
-                    existing_owner = o
-    except Exception:
-        pass
-
-    if existing_token and existing_owner:
-        print(f"{CLR_GREEN}✅ Найдена существующая конфигурация!{CLR_RESET}")
-        print(f"  🔑 Токен: {CLR_YELLOW}{existing_token[:6]}...{existing_token[-6:]}{CLR_RESET}")
-        print(f"  👤 ID владельца: {CLR_YELLOW}{existing_owner}{CLR_RESET}")
-        bot_token = existing_token
-        owner_id = existing_owner
-    else:
-        while True:
-            bot_token = input(f"🔑 {CLR_YELLOW}Введите Telegram Bot Token:{CLR_RESET} ").strip()
-            if re.match(r"^[0-9]+:[a-zA-Z0-9_-]+$", bot_token):
-                break
-            print(f"{CLR_RED}❌ Неверный формат токена! Пример: 123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ{CLR_RESET}")
-
-        while True:
-            owner_id = input(f"👤 {CLR_YELLOW}Введите Ваш Telegram ID (только цифры):{CLR_RESET} ").strip()
-            if re.match(r"^[0-9]+$", owner_id):
-                break
-            print(f"{CLR_RED}❌ ID должен состоять только из цифр!{CLR_RESET}")
-        
-    print()
-
-    # 2. Установка pip-пакетов
-    print(f"{CLR_CYAN}[2/5] Установка зависимостей Python...{CLR_RESET}")
-    
-    # Пытаемся обновить pip, но не падаем при неудаче
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--break-system-packages"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-    # Умная установка пакетов с поддержкой --break-system-packages
-    packages = ["aiogram", "orjson", "aiohttp", "curl_cffi", "playwright"]
-    installed = False
-    
-    try:
-        # Пробуем установить с флагом --break-system-packages (для Debian/Ubuntu PEP 668)
-        subprocess.run([sys.executable, "-m", "pip", "install"] + packages + ["--break-system-packages"], check=True)
-        installed = True
-    except subprocess.CalledProcessError:
-        pass
-
-    if not installed:
-        try:
-            # Если не вышло (например, старый pip), пробуем без флага
-            subprocess.run([sys.executable, "-m", "pip", "install"] + packages, check=True)
-        except Exception as e:
-            print(f"{CLR_RED}❌ Ошибка при установке зависимостей: {e}{CLR_RESET}")
-            sys.exit(1)
-
-    # Инициализация playwright
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-    except Exception as e:
-        print(f"{CLR_RED}❌ Ошибка при установке браузера Playwright: {e}{CLR_RESET}")
-        sys.exit(1)
-
-    # Пути
-    INSTALL_DIR = Path(__file__).parent.resolve()
-    HOME_DIR = Path.home()
-    STATE_DIR = HOME_DIR / ".claude" / "channels" / "telegram"
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Запись настроек
-    (STATE_DIR / ".env").write_text(f"TELEGRAM_BOT_TOKEN={bot_token}\n", encoding="utf-8")
-    (STATE_DIR / "access.json").write_text(f'{{"allowFrom": ["{owner_id}"]}}\n', encoding="utf-8")
-    print(f"{CLR_GREEN}✅ Конфигурация успешно сохранена в {STATE_DIR}{CLR_RESET}")
-
-    # 3. Создание обертки запуска
-    print(f"\n{CLR_CYAN}[3/5] Создание обертки запуска бота...{CLR_RESET}")
-    
-    wrapper_code = r"""#!/usr/bin/env python3
+# Launcher template written to /usr/local/bin/claude-telegram-bot (and its Windows copy).
+# Placeholders ##HOME## / ##INSTALL_DIR## are substituted by render_wrapper().
+WRAPPER_TEMPLATE = r"""#!/usr/bin/env python3
 import json
 import os
 import re
@@ -424,11 +315,159 @@ import urllib.request
 import signal
 from pathlib import Path
 
-STATE_DIR = Path("##HOME##/.claude/channels/telegram")
-ACTIVE_CLI_FILE = STATE_DIR / "active_cli"
+HOME_DIR = Path("##HOME##")
+CLAUDE_JSON_PATH = HOME_DIR / ".claude.json"
+# Owner state dir: holds .env (bot token), the owner's access.json and the guests/ tree.
+OWNER_STATE_DIR = Path("##HOME##/.claude/channels/telegram")
+# Per-instance state dir. Owner: OWNER_STATE_DIR. Guest: OWNER_STATE_DIR/guests/<uid>.
+# Rebound in main() for --guest mode (see _use_state_dir).
+STATE_DIR = OWNER_STATE_DIR
+ACTIVE_CLI_FILE = OWNER_STATE_DIR / "active_cli"
 LOG_FILE_PATH = STATE_DIR / "bot.log"
 LAST_MODEL_FILE = STATE_DIR / "last_launched_model"
 SESSION_LIMIT_FILE = STATE_DIR / "last_session_limit"
+
+GUEST_PREAMBLE = (
+    "You are a guest instance of this Telegram bot: you work for Telegram user {uid}, "
+    "who is the decision-maker for this session (the bot owner has pre-authorized them). "
+    "Your working directory is {work_dir}. "
+    "Do not modify or stop the Telegram bridge itself (~/.claude/channels/telegram, "
+    "the claude-gram plugin, claude-telegram*.service units)."
+)
+
+def parse_args(argv):
+    # `claude-telegram-bot` -> None (owner). `claude-telegram-bot --guest <uid>` -> "<uid>".
+    if not argv:
+        return None
+    if len(argv) == 2 and argv[0] == "--guest" and re.fullmatch(r"[0-9]+", argv[1]):
+        return argv[1]
+    sys.stderr.write("usage: claude-telegram-bot [--guest <numeric uid>]\n")
+    raise SystemExit(2)
+
+def guest_paths(home, uid, guests_dir_env=None):
+    # Returns (state_dir, work_dir) for a guest instance. Pure.
+    if not re.fullmatch(r"[0-9]+", str(uid)):
+        raise ValueError(f"invalid guest uid: {uid!r}")
+    home = Path(home)
+    state_dir = home / ".claude" / "channels" / "telegram" / "guests" / str(uid)
+    base = Path(guests_dir_env) if guests_dir_env else home / "guests"
+    return state_dir, base / str(uid)
+
+def _use_state_dir(state_dir) -> None:
+    global STATE_DIR, LOG_FILE_PATH, LAST_MODEL_FILE, SESSION_LIMIT_FILE
+    STATE_DIR = Path(state_dir)
+    LOG_FILE_PATH = STATE_DIR / "bot.log"
+    LAST_MODEL_FILE = STATE_DIR / "last_launched_model"
+    SESSION_LIMIT_FILE = STATE_DIR / "last_session_limit"
+
+def read_bot_token() -> str:
+    # Token always comes from the owner's .env, also for guest instances.
+    env_path = OWNER_STATE_DIR / ".env"
+    try:
+        if env_path.exists():
+            for line in env_path.read_text("utf-8").splitlines():
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+def read_model(settings_path) -> str:
+    try:
+        if Path(settings_path).exists():
+            model = json.loads(Path(settings_path).read_text("utf-8")).get("model")
+            if isinstance(model, str):
+                return model
+    except Exception:
+        pass
+    return ""
+
+def read_guest_instructions() -> str:
+    try:
+        path = OWNER_STATE_DIR / "guests" / "instructions.md"
+        if path.exists():
+            return path.read_text("utf-8")
+    except Exception:
+        pass
+    return ""
+
+def build_guest_system_prompt(uid, work_dir, instructions_text) -> str:
+    parts = [GUEST_PREAMBLE.format(uid=uid, work_dir=work_dir)]
+    if instructions_text and instructions_text.strip():
+        parts.append(instructions_text.strip())
+    return "\n\n".join(parts)
+
+def build_guest_launch(uid, state_dir, work_dir, model_val, session_args, instructions_text, token, base_env):
+    # Pure: returns (cmd, env) for a guest claude process.
+    state_dir = Path(state_dir)
+    settings_file = state_dir / "settings.json"
+    env = dict(base_env)
+    env.pop("CLAUDE_CODE_CHILD_SESSION", None)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    env["CLAUDE_TELEGRAM_BACKGROUND"] = "1"
+    env["CLAUDE_GRAM_GUEST_UID"] = str(uid)
+    env["TELEGRAM_STATE_DIR"] = str(state_dir)
+    env["CLAUDE_GRAM_SETTINGS_FILE"] = str(settings_file)
+    if token:
+        env["TELEGRAM_BOT_TOKEN"] = token
+    cmd = ["claude", "--channels", "plugin:claude-gram@justidev-marketplace",
+           "--settings", str(settings_file)]
+    if model_val:
+        cmd.extend(["--model", model_val])
+    cmd.extend(session_args)
+    cmd.extend(["--append-system-prompt",
+                build_guest_system_prompt(uid, work_dir, instructions_text)])
+    return cmd, env
+
+def ensure_trusted(claude_json_path, project_dir) -> bool:
+    # Mark project_dir as trusted (and skip first-run onboarding/theme) in ~/.claude.json.
+    # Only rewrites when something changes; never creates the file. Never raises.
+    # Returns True when the file was changed.
+    try:
+        path = Path(claude_json_path)
+        if not path.exists():
+            return False
+        data = json.loads(path.read_text("utf-8"))
+        if not isinstance(data, dict):
+            return False
+        changed = False
+        if "projects" not in data:
+            data["projects"] = {}
+            changed = True
+        projects = data["projects"]
+        if not isinstance(projects, dict):
+            return False
+        key = str(project_dir)
+        proj = projects.get(key)
+        if not isinstance(proj, dict):
+            proj = {}
+            projects[key] = proj
+            changed = True
+        if proj.get("hasTrustDialogAccepted") is not True:
+            proj["hasTrustDialogAccepted"] = True
+            changed = True
+        if not data.get("hasCompletedOnboarding"):
+            data["hasCompletedOnboarding"] = True
+            changed = True
+        if not data.get("theme"):
+            data["theme"] = "dark"
+            changed = True
+        if not changed:
+            return False
+        tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+        try:
+            shutil.copymode(path, tmp)
+        except Exception:
+            pass
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        try:
+            sys.stderr.write(f"ensure_trusted failed for {claude_json_path}: {e}\n")
+        except Exception:
+            pass
+        return False
 
 def resolve_claude_bin() -> str:
     # PATH в systemd-юните урезан, поэтому кроме which проверяем типовые пути.
@@ -463,13 +502,7 @@ def send_telegram_alert(text: str, reply_markup: dict = None) -> None:
             if val and val != "None":
                 thread_id = int(val)
 
-        env_path = STATE_DIR / ".env"
-        token = None
-        if env_path.exists():
-            for line in env_path.read_text("utf-8").splitlines():
-                if line.startswith("TELEGRAM_BOT_TOKEN="):
-                    token = line.split("=", 1)[1].strip()
-                    break
+        token = read_bot_token()
         if not token:
             return
 
@@ -494,7 +527,7 @@ def send_telegram_alert(text: str, reply_markup: dict = None) -> None:
         sys.stderr.write(f"Failed to send Telegram alert: {e}\n")
 
 def get_active_session_id() -> str:
-    active_sess_file = Path("##HOME##/.claude/channels/telegram/active_session_id")
+    active_sess_file = STATE_DIR / "active_session_id"
     if active_sess_file.exists():
         try:
             val = active_sess_file.read_text("utf-8").strip()
@@ -621,13 +654,7 @@ def delete_thinking_message() -> None:
             return
         chat_id = access["allowFrom"][0]
 
-        env_path = STATE_DIR / ".env"
-        token = None
-        if env_path.exists():
-            for line in env_path.read_text("utf-8").splitlines():
-                if line.startswith("TELEGRAM_BOT_TOKEN="):
-                    token = line.split("=", 1)[1].strip()
-                    break
+        token = read_bot_token()
         if not token:
             return
 
@@ -661,25 +688,52 @@ def clean_mcp_auth_cache() -> None:
 
 
 def main() -> int:
+    guest_uid = parse_args(sys.argv[1:])
     os.environ["CLAUDE_TELEGRAM_BACKGROUND"] = "1"
     clean_mcp_auth_cache()
     cli = get_active_cli()
-    if cli == "agy" or not Path("##HOME##/.claude/.credentials.json").exists():
-        sys.stderr.write("No active credentials found. Running server.py standalone...\n")
-        cmd = ["python3" if sys.platform != "win32" else sys.executable, "##INSTALL_DIR##/server.py"]
-        os.execvp(cmd[0], cmd)
-        return 0
+    has_creds = Path("##HOME##/.claude/.credentials.json").exists()
+
+    if guest_uid is not None:
+        # Guest instance: never fall back to standalone server.py (that would be a second poller).
+        if sys.platform == "win32":
+            sys.stderr.write("Guest instances are not supported on Windows.\n")
+            return 1
+        if cli == "agy" or not has_creds:
+            sys.stderr.write("Guest instance: no active Claude credentials. Exiting.\n")
+            return 1
+        token = read_bot_token()
+        if not token:
+            sys.stderr.write("Guest instance: TELEGRAM_BOT_TOKEN missing in owner .env. Exiting.\n")
+            return 1
+        state_dir, work_dir = guest_paths(str(HOME_DIR), guest_uid, os.environ.get("CLAUDE_GRAM_GUESTS_DIR"))
+        _use_state_dir(state_dir)
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            work_dir.mkdir(parents=True, exist_ok=True)
+            settings_file = STATE_DIR / "settings.json"
+            if not settings_file.exists():
+                settings_file.write_text("{}\n", encoding="utf-8")
+        except Exception as e:
+            sys.stderr.write(f"Guest instance: cannot prepare state dir: {e}\n")
+            return 1
+        ensure_trusted(CLAUDE_JSON_PATH, work_dir)
+        os.chdir(work_dir)
+        model_val = read_model(STATE_DIR / "settings.json")
+    else:
+        token = ""
+        work_dir = None
+        if cli == "agy" or not has_creds:
+            sys.stderr.write("No active credentials found. Running server.py standalone...\n")
+            cmd = ["python3" if sys.platform != "win32" else sys.executable, "##INSTALL_DIR##/server.py"]
+            os.execvp(cmd[0], cmd)
+            return 0
+        ensure_trusted(CLAUDE_JSON_PATH, HOME_DIR)
+        model_val = read_model(HOME_DIR / ".claude" / "settings.json")
 
     cmd = ["claude", "--channels", "plugin:claude-gram@justidev-marketplace"]
-    model_val = None
-    try:
-        settings_path = Path("##HOME##/.claude/settings.json")
-        if settings_path.exists():
-            model_val = json.loads(settings_path.read_text("utf-8")).get("model")
-            if model_val:
-                cmd.extend(["--model", model_val])
-    except Exception:
-        pass
+    if guest_uid is None and model_val:
+        cmd.extend(["--model", model_val])
 
     # Resume the previous session when one exists; start fresh only when it does
     # not (first run, or after a "no conversation found" recovery reset).
@@ -696,14 +750,21 @@ def main() -> int:
     )
     if persist_id:
         try:
-            active_sess_file = Path("##HOME##/.claude/channels/telegram/active_session_id")
+            active_sess_file = STATE_DIR / "active_session_id"
             active_sess_file.parent.mkdir(parents=True, exist_ok=True)
             active_sess_file.write_text(persist_id, "utf-8")
         except Exception:
             pass
-    cmd.extend(session_args)
+    if guest_uid is not None:
+        cmd, env = build_guest_launch(
+            guest_uid, STATE_DIR, work_dir, model_val, session_args,
+            read_guest_instructions(), token, dict(os.environ))
+        os.environ.clear()
+        os.environ.update(env)
+    else:
+        cmd.extend(session_args)
 
-    if sys.platform == "win32":
+    if guest_uid is None and sys.platform == "win32":
         # Windows PTY is not supported, run server.py standalone as fallback in wrapper
         sys.stderr.write("Running Claude-Gram server.py standalone on Windows...\n")
         cmd = [sys.executable, "##INSTALL_DIR##/server.py"]
@@ -781,7 +842,7 @@ def main() -> int:
                 if m:
                     new_sess_id = m.group(1)
                     try:
-                        active_sess_file = Path("##HOME##/.claude/channels/telegram/active_session_id")
+                        active_sess_file = STATE_DIR / "active_session_id"
                         active_sess_file.parent.mkdir(parents=True, exist_ok=True)
                         active_sess_file.write_text(new_sess_id, "utf-8")
                     except Exception:
@@ -894,8 +955,149 @@ if __name__ == "__main__":
     sys.exit(main())
 """
 
-    wrapper_code = wrapper_code.replace("##HOME##", str(HOME_DIR).replace("\\", "\\\\"))
-    wrapper_code = wrapper_code.replace("##INSTALL_DIR##", str(INSTALL_DIR).replace("\\", "\\\\"))
+def render_wrapper(home_dir, install_dir) -> str:
+    code = WRAPPER_TEMPLATE.replace("##HOME##", str(home_dir).replace("\\", "\\\\"))
+    code = code.replace("##INSTALL_DIR##", str(install_dir).replace("\\", "\\\\"))
+    return code
+
+def render_guest_unit(user, home, path_env, wrapper_path) -> str:
+    # systemd template unit: one instance per guest, e.g. claude-telegram-guest@123.service
+    return f"""[Unit]
+Description=Claude Code Telegram guest instance %i
+After=network-online.target claude-telegram.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+WorkingDirectory={home}
+Environment=HOME={home}
+Environment=CLAUDE_ALLOW_ROOT=1
+Environment=PATH={path_env}
+UnsetEnvironment=CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_ENTRYPOINT
+ExecStart={wrapper_path} --guest %i
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+def main():
+    print_banner()
+    start_mascot_animation()
+    time.sleep(2.5)  # маскот покачивается пару секунд
+    stop_mascot_animation()
+    print_claudgramik()  # статичный маскот остаётся на экране
+    
+    # 1. Интерактивный опрос / Автоопределение
+    print(f"{CLR_CYAN}[1/5] Настройка Telegram конфигурации:{CLR_RESET}")
+    
+    HOME_DIR = Path.home()
+    STATE_DIR = HOME_DIR / ".claude" / "channels" / "telegram"
+    existing_token = None
+    existing_owner = None
+    
+    # Пытаемся прочитать существующие настройки
+    try:
+        import json
+        env_file = STATE_DIR / ".env"
+        if env_file.exists():
+            for line in env_file.read_text("utf-8").splitlines():
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    t = line.split("=", 1)[1].strip()
+                    if re.match(r"^[0-9]+:[a-zA-Z0-9_-]+$", t):
+                        existing_token = t
+                        break
+    except Exception:
+        pass
+        
+    try:
+        import json
+        access_file = STATE_DIR / "access.json"
+        if access_file.exists():
+            data = json.loads(access_file.read_text("utf-8"))
+            if data.get("allowFrom") and isinstance(data["allowFrom"], list) and len(data["allowFrom"]) > 0:
+                o = str(data["allowFrom"][0]).strip()
+                if re.match(r"^[0-9]+$", o):
+                    existing_owner = o
+    except Exception:
+        pass
+
+    if existing_token and existing_owner:
+        print(f"{CLR_GREEN}✅ Найдена существующая конфигурация!{CLR_RESET}")
+        print(f"  🔑 Токен: {CLR_YELLOW}{existing_token[:6]}...{existing_token[-6:]}{CLR_RESET}")
+        print(f"  👤 ID владельца: {CLR_YELLOW}{existing_owner}{CLR_RESET}")
+        bot_token = existing_token
+        owner_id = existing_owner
+    else:
+        while True:
+            bot_token = input(f"🔑 {CLR_YELLOW}Введите Telegram Bot Token:{CLR_RESET} ").strip()
+            if re.match(r"^[0-9]+:[a-zA-Z0-9_-]+$", bot_token):
+                break
+            print(f"{CLR_RED}❌ Неверный формат токена! Пример: 123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ{CLR_RESET}")
+
+        while True:
+            owner_id = input(f"👤 {CLR_YELLOW}Введите Ваш Telegram ID (только цифры):{CLR_RESET} ").strip()
+            if re.match(r"^[0-9]+$", owner_id):
+                break
+            print(f"{CLR_RED}❌ ID должен состоять только из цифр!{CLR_RESET}")
+        
+    print()
+
+    # 2. Установка pip-пакетов
+    print(f"{CLR_CYAN}[2/5] Установка зависимостей Python...{CLR_RESET}")
+    
+    # Пытаемся обновить pip, но не падаем при неудаче
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--break-system-packages"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    # Умная установка пакетов с поддержкой --break-system-packages
+    packages = ["aiogram", "orjson", "aiohttp", "curl_cffi", "playwright"]
+    installed = False
+    
+    try:
+        # Пробуем установить с флагом --break-system-packages (для Debian/Ubuntu PEP 668)
+        subprocess.run([sys.executable, "-m", "pip", "install"] + packages + ["--break-system-packages"], check=True)
+        installed = True
+    except subprocess.CalledProcessError:
+        pass
+
+    if not installed:
+        try:
+            # Если не вышло (например, старый pip), пробуем без флага
+            subprocess.run([sys.executable, "-m", "pip", "install"] + packages, check=True)
+        except Exception as e:
+            print(f"{CLR_RED}❌ Ошибка при установке зависимостей: {e}{CLR_RESET}")
+            sys.exit(1)
+
+    # Инициализация playwright
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        print(f"{CLR_RED}❌ Ошибка при установке браузера Playwright: {e}{CLR_RESET}")
+        sys.exit(1)
+
+    # Пути
+    INSTALL_DIR = Path(__file__).parent.resolve()
+    HOME_DIR = Path.home()
+    STATE_DIR = HOME_DIR / ".claude" / "channels" / "telegram"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Запись настроек
+    (STATE_DIR / ".env").write_text(f"TELEGRAM_BOT_TOKEN={bot_token}\n", encoding="utf-8")
+    (STATE_DIR / "access.json").write_text(f'{{"allowFrom": ["{owner_id}"]}}\n', encoding="utf-8")
+    print(f"{CLR_GREEN}✅ Конфигурация успешно сохранена в {STATE_DIR}{CLR_RESET}")
+
+    # 3. Создание обертки запуска
+    print(f"\n{CLR_CYAN}[3/5] Создание обертки запуска бота...{CLR_RESET}")
+    
+    wrapper_code = render_wrapper(HOME_DIR, INSTALL_DIR)
+
 
     if sys.platform == "win32":
         WRAPPER_PATH = STATE_DIR / "claude-telegram-bot.py"
@@ -1227,6 +1429,20 @@ WantedBy=multi-user.target
                 print(f"{CLR_GREEN}✅ systemd служба claude-telegram успешно запущена!{CLR_RESET}")
             except Exception as e:
                 print(f"{CLR_RED}❌ Ошибка при настройке systemd службы: {e}{CLR_RESET}")
+
+            # Guest template unit (instances are enabled manually: systemctl enable --now claude-telegram-guest@<uid>)
+            guest_service_content = render_guest_unit(
+                resolve_service_user(HOME_DIR), HOME_DIR,
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", WRAPPER_PATH)
+            guest_service_file = Path("/etc/systemd/system/claude-telegram-guest@.service")
+            try:
+                temp_guest = Path("/tmp/claude-telegram-guest@.service.tmp")
+                temp_guest.write_text(guest_service_content, encoding="utf-8")
+                subprocess.run(["sudo", "mv", str(temp_guest), str(guest_service_file)], check=True)
+                subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
+                print(f"{CLR_GREEN}✅ Шаблон гостевых служб claude-telegram-guest@ установлен!{CLR_RESET}")
+            except Exception as e:
+                print(f"{CLR_RED}⚠️ Не удалось установить шаблон гостевой службы: {e}{CLR_RESET}")
         elif shutil.which("pm2"):
             try:
                 subprocess.run(["pm2", "delete", "claude-telegram"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

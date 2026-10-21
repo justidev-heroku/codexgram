@@ -216,33 +216,13 @@ def test_dm_command_gate_owner_guest_stranger(state):
         assert server.dm_command_gate(guest_msg) is None
         assert server.dm_command_gate(stranger_msg) is None
         await asyncio.sleep(0)
-        guest_msg.answer.assert_awaited_once()
-        assert "только владельцу" in guest_msg.answer.await_args.args[0]
+        guest_msg.answer.assert_not_awaited()  # гости обслуживаются своим экземпляром
         stranger_msg.answer.assert_not_awaited()
         owner_msg.answer.assert_not_awaited()
 
     asyncio.run(run())
 
 
-# /model /effort /auto /close /restart /goal /resume /usage у гостя — свои версии
-# (tests/test_guest_commands.py); здесь — только команды, оставшиеся у владельца.
-@pytest.mark.parametrize("handler", ["cmd_share", "cmd_unshare", "cmd_access", "cmd_login",
-                                     "cmd_logout", "cmd_switch_account", "cmd_mcp_debug", "cmd_check_update",
-                                     "cmd_accounts", "cmd_save_account", "cmd_delete_account"])
-def test_guest_denied_admin_commands(state, handler):
-    write_access(state, {"allowFrom": [OWNER, GUEST]})
-    server.load_access()  # миграция owner
-    before = read_access(state)
-
-    async def run():
-        msg = make_msg(GUEST, f"/x {STRANGER}")
-        await getattr(server, handler)(msg)
-        await asyncio.sleep(0)
-        msg.answer.assert_awaited_once()
-        assert "только владельцу" in msg.answer.await_args.args[0]
-
-    asyncio.run(run())
-    assert read_access(state) == before
 
 
 def test_owner_share_command_works(state):
@@ -298,31 +278,16 @@ def test_guest_denied_permission_callback(state):
 def inbound(monkeypatch):
     deliver = AsyncMock()
     notify = AsyncMock()
-    enqueue = AsyncMock()
     bot = MagicMock()
     bot.send_message = AsyncMock()
     bot.set_message_reaction = AsyncMock()
     monkeypatch.setattr(server, "deliver", deliver)
     monkeypatch.setattr(server, "notify", notify)
-    monkeypatch.setattr(server, "enqueue_guest_message", enqueue)
     monkeypatch.setattr(server, "start_thinking", AsyncMock())
     monkeypatch.setattr(server, "bot", bot)
-    return SimpleNamespace(deliver=deliver, notify=notify, bot=bot, enqueue=enqueue)
+    return SimpleNamespace(deliver=deliver, notify=notify, bot=bot)
 
 
-def test_guest_message_goes_to_own_runner_not_owner_session(state, inbound):
-    write_access(state, {"allowFrom": [OWNER, GUEST]})
-    msg = make_msg(GUEST, "hello from guest", username="pal", first="Pal")
-    asyncio.run(server.handle_inbound(msg, msg.text))
-
-    # в сессию владельца ничего не уходит, владелец не уведомляется
-    inbound.deliver.assert_not_awaited()
-    inbound.notify.assert_not_awaited()
-    inbound.bot.send_message.assert_not_awaited()
-    inbound.enqueue.assert_awaited_once()
-    uid, chat_id, prompt, name = inbound.enqueue.await_args.args
-    assert uid == GUEST and chat_id == GUEST
-    assert "hello from guest" in prompt and name == "Pal"
 
 
 def test_owner_message_has_no_guest_meta(state, inbound):
@@ -333,7 +298,6 @@ def test_owner_message_has_no_guest_meta(state, inbound):
     meta = inbound.deliver.await_args.args[1]
     assert "role" not in meta and "guest" not in meta
     inbound.bot.send_message.assert_not_awaited()
-    inbound.enqueue.assert_not_awaited()
 
 
 def test_stranger_message_dropped(state, inbound):
@@ -341,7 +305,6 @@ def test_stranger_message_dropped(state, inbound):
     msg = make_msg(STRANGER, "let me in")
     asyncio.run(server.handle_inbound(msg, "let me in"))
     inbound.deliver.assert_not_awaited()
-    inbound.enqueue.assert_not_awaited()
     inbound.bot.send_message.assert_not_awaited()
 
 
@@ -351,30 +314,10 @@ def test_unshared_guest_is_dropped(state, inbound):
     server.unshare_access(GUEST)
     asyncio.run(server.handle_inbound(make_msg(GUEST, "hi"), "hi"))
     inbound.deliver.assert_not_awaited()
-    inbound.enqueue.assert_not_awaited()
 
 
-def test_guest_cannot_answer_permission_prompt(state, inbound):
-    write_access(state, {"allowFrom": [OWNER, GUEST]})
-    msg = make_msg(GUEST, "yes abcde")
-    asyncio.run(server.handle_inbound(msg, "yes abcde"))
-    for call in inbound.notify.await_args_list:
-        assert call.args[0] != "notifications/claude/channel/permission"
-    inbound.deliver.assert_not_awaited()
-    inbound.enqueue.assert_awaited_once()  # ушло гостевому Клоду как обычный текст
 
 
-def test_guest_does_not_hijack_session_thread(state, inbound, monkeypatch):
-    write_access(state, {"allowFrom": [OWNER, GUEST]})
-    monkeypatch.setattr(server, "session_thread_id", 77)
-    saved = MagicMock()
-    monkeypatch.setattr(server, "_save_thread_id", saved)
-    msg = make_msg(GUEST, "hi")
-    msg.message_thread_id = 999
-    asyncio.run(server.handle_inbound(msg, "hi"))
-    assert server.session_thread_id == 77
-    saved.assert_not_called()
-    inbound.enqueue.assert_awaited_once()
 
 
 def test_thread_kwargs_only_for_owner_chat(state, monkeypatch):
