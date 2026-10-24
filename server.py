@@ -3404,6 +3404,7 @@ async def save_logged_in_credentials(chat_id: str) -> None:
     
     if src_credentials.exists():
         write_secret(target_credentials, src_credentials.read_text("utf-8"))
+        _forget_dead_profile(name)
         if src_claude_json.exists():
             write_secret(target_claude_json, src_claude_json.read_text("utf-8"))
             
@@ -3557,15 +3558,21 @@ async def cmd_accounts(msg: Message) -> None:
         
     profiles = list_profiles()
     active_email = get_active_profile_email()
+    cur_profile = current_profile_name()
+    dead = _load_dead_profiles()
     
     text = "<b>Доступные профили Claude Code:</b>\n\n"
     if not profiles:
         text += "<i>(нет сохраненных профилей)</i>\n\n"
     else:
         for p in profiles:
-            is_active = (active_email and p["email"] == active_email)
-            marker = "🟢 (активен)" if is_active else "⚪"
-            text += f"{marker} <code>{p['name']}</code>: <i>{p['email']}</i>\n"
+            if cur_profile:
+                is_active = p["name"] == cur_profile
+            else:
+                is_active = bool(active_email and p["email"] == active_email)
+            marker = "✅ активный" if is_active else "⚪"
+            dead_mark = " ⚠️ токен не обновляется" if p["name"] in dead else ""
+            text += f"{marker} <code>{p['name']}</code>: <i>{p['email']}</i>{dead_mark}\n"
         text += "\n"
         
     if active_email:
@@ -3606,6 +3613,8 @@ async def cmd_save_account(msg: Message) -> None:
         target_claude_json = (USER_HOME / f".claude.{name}.json")
         
         write_secret(target_credentials, active_credentials.read_text("utf-8"))
+        _forget_dead_profile(name)
+        _set_active_profile(name)
         if active_claude_json.exists():
             write_secret(target_claude_json, active_claude_json.read_text("utf-8"))
             
@@ -3706,11 +3715,12 @@ async def refresh_oauth_token_playwright(refresh_token: str) -> dict:
             await browser.close()
 
 
-async def refresh_oauth_token(creds_path: Path) -> str:
+async def refresh_oauth_token(creds_path: Path, allow_browser: bool = True, force: bool = False) -> str:
     """Обновляет access token если истёк. Возвращает: 'refreshed', 'ok' (не истёк), 'error'.
 
     Использует curl_cffi для подмены TLS-отпечатка Chrome. Если Cloudflare блокирует запрос,
-    переключается на Playwright Chromium для обхода JS-челленджа.
+    переключается на Playwright Chromium для обхода JS-челленджа. allow_browser=False отключает
+    Playwright (тогда блокировка даёт 'error'). force=True обновляет токен, даже если он ещё живой.
     """
     cache_key = str(creds_path)
     # Если ещё в кулдауне — не дёргаем эндпоинт
@@ -3728,7 +3738,7 @@ async def refresh_oauth_token(creds_path: Path) -> str:
             return "error"
 
         # Не истёк — ничего делать не надо (с запасом 60 сек)
-        if expires_at > int(time.time() * 1000) + 60_000:
+        if not force and expires_at > int(time.time() * 1000) + 60_000:
             return "ok"
 
         payload = {
@@ -3771,6 +3781,8 @@ async def refresh_oauth_token(creds_path: Path) -> str:
             use_playwright = True
 
         # 2. Надежный путь через Playwright
+        if use_playwright and not allow_browser:
+            return "error"
         if use_playwright:
             try:
                 resp_data = await refresh_oauth_token_playwright(refresh_token)
@@ -3800,6 +3812,290 @@ async def refresh_oauth_token(creds_path: Path) -> str:
         return "error"
 
 
+# ---------------------------------------------------------------------------
+# Профили аккаунтов: активный профиль, синхронизация и keepalive.
+#
+# Claude Code ротирует refresh token: при обновлении пишет новую пару в активный
+# .credentials.json и инвалидирует старую. Поэтому свежий активный файл надо
+# переносить обратно в профиль (sync), иначе при возврате на профиль его токен мёртв.
+# ---------------------------------------------------------------------------
+
+PROFILE_SYNC_INTERVAL = 60  # сек: как часто проверяем mtime активного .credentials.json
+PROFILE_KEEPALIVE_INTERVAL = 30 * 60  # сек: как часто обновляем неактивные профили
+PROFILE_KEEPALIVE_GAP = 20  # сек между профилями, чтобы не бить по эндпоинту пачкой
+PROFILE_KEEPALIVE_WINDOW_MS = 2 * 3600 * 1000  # обновляем, если токен истекает в течение 2 ч
+PROFILE_ACCOUNT_KEYS = ("oauthAccount", "userID")  # что переключаем в ~/.claude.json
+
+
+def _active_creds_path() -> Path:
+    return USER_HOME / ".claude" / ".credentials.json"
+
+
+def _active_claude_json_path() -> Path:
+    return USER_HOME / ".claude.json"
+
+
+def _profile_creds_path(name: str) -> Path:
+    return USER_HOME / ".claude" / f".credentials.{name}.json"
+
+
+def _profile_claude_json_path(name: str) -> Path:
+    return USER_HOME / f".claude.{name}.json"
+
+
+def _read_json_dict(path: Path) -> dict | None:
+    """dict из JSON-файла или None (нет файла / не читается / не объект)."""
+    try:
+        data = orjson.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def list_profile_names() -> list[str]:
+    names = []
+    for f in glob.glob(str(USER_HOME / ".claude" / ".credentials.*.json")):
+        name = os.path.basename(f)[len(".credentials."):-len(".json")]
+        if name:
+            names.append(name)
+    return sorted(names)
+
+
+def _account_identity(claude_json: Path, creds: Path) -> dict:
+    """accountUuid/email из ~/.claude.json-подобного файла и refreshToken из .credentials-подобного."""
+    cj = _read_json_dict(claude_json) or {}
+    acc = cj.get("oauthAccount") if isinstance(cj.get("oauthAccount"), dict) else {}
+    cr = _read_json_dict(creds) or {}
+    oauth = cr.get("claudeAiOauth") if isinstance(cr.get("claudeAiOauth"), dict) else {}
+    return {
+        "uuid": acc.get("accountUuid") or "",
+        "email": acc.get("emailAddress") or "",
+        "refresh": oauth.get("refreshToken") or "",
+    }
+
+
+def _set_active_profile(name: str | None) -> None:
+    path = STATE_DIR / "active_profile"
+    try:
+        if name:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(name, "utf-8")
+        else:
+            path.unlink(missing_ok=True)
+    except OSError as e:
+        log(f"active_profile write failed: {e}")
+
+
+def current_profile_name() -> str | None:
+    """Имя профиля, из которого сейчас взят активный аккаунт; None, если не понятно.
+
+    Сначала STATE_DIR/active_profile (если такой профиль ещё есть), иначе сопоставляем
+    активный ~/.claude.json и .credentials.json с сохранёнными профилями.
+    """
+    try:
+        marked = (STATE_DIR / "active_profile").read_text("utf-8").strip()
+    except OSError:
+        marked = ""
+    if marked and _profile_creds_path(marked).exists():
+        return marked
+
+    active = _account_identity(_active_claude_json_path(), _active_creds_path())
+    if not (active["uuid"] or active["email"] or active["refresh"]):
+        return None
+    matches = set()
+    for name in list_profile_names():
+        ident = _account_identity(_profile_claude_json_path(name), _profile_creds_path(name))
+        if active["uuid"] and ident["uuid"]:
+            same_account = active["uuid"] == ident["uuid"]
+        else:
+            same_account = bool(active["email"]) and active["email"] == ident["email"]
+        if same_account or (active["refresh"] and active["refresh"] == ident["refresh"]):
+            matches.add(name)
+    return matches.pop() if len(matches) == 1 else None
+
+
+def sync_active_to_profile() -> str | None:
+    """Переносит активный .credentials.json в профиль текущего аккаунта.
+
+    Возвращает имя синхронизированного профиля или None (нечего делать / не удалось).
+    Невалидный или пустой JSON никогда не пишем в профиль.
+    """
+    name = current_profile_name()
+    if not name:
+        return None
+    active_path = _active_creds_path()
+    try:
+        raw = active_path.read_text("utf-8")
+        data = orjson.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("claudeAiOauth"), dict):
+        return None
+
+    target = _profile_creds_path(name)
+    if _read_json_dict(target) == data:
+        return None
+
+    # Защита от перепутывания аккаунтов: если в профиле и в активном ~/.claude.json разные accountUuid,
+    # активный вход сделан вне профиля (например, claude /login) — не перезаписываем профиль.
+    prof_uuid = _account_identity(_profile_claude_json_path(name), target)["uuid"]
+    act_uuid = _account_identity(_active_claude_json_path(), active_path)["uuid"]
+    if prof_uuid and act_uuid and prof_uuid != act_uuid:
+        log(f"profile sync skipped: active account differs from profile {name}")
+        return None
+
+    write_secret(target, raw)
+    return name
+
+
+def _load_dead_profiles() -> set[str]:
+    try:
+        data = orjson.loads((STATE_DIR / "profile_dead.json").read_bytes())
+    except (OSError, ValueError):
+        return set()
+    return {str(x) for x in data} if isinstance(data, list) else set()
+
+
+def _save_dead_profiles(names: set[str]) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (STATE_DIR / "profile_dead.json").write_bytes(orjson.dumps(sorted(names)))
+    except OSError as e:
+        log(f"profile_dead.json write failed: {e}")
+
+
+def _forget_dead_profile(name: str) -> None:
+    dead = _load_dead_profiles()
+    if name in dead:
+        dead.discard(name)
+        _save_dead_profiles(dead)
+
+
+def _merge_account_into_claude_json(active_path: Path, profile_path: Path) -> None:
+    """Переключает в ~/.claude.json только аккаунт (oauthAccount, userID).
+
+    Остальное (projects с trust-флагами, mcpServers, онбординг) сохраняем. Если в профиле
+    аккаунта нет, эти ключи из активного файла убираем.
+    """
+    current = _read_json_dict(active_path)
+    if current is None:
+        if active_path.exists():
+            log("~/.claude.json unreadable, rebuilding account keys only")
+        current = {}
+    profile = _read_json_dict(profile_path) if profile_path.exists() else None
+    for key in PROFILE_ACCOUNT_KEYS:
+        if profile is not None and key in profile:
+            current[key] = profile[key]
+        else:
+            current.pop(key, None)
+    write_secret(active_path, orjson.dumps(current, option=orjson.OPT_INDENT_2).decode("utf-8"))
+
+
+async def _notify_dead_profile(bot: Bot, name: str) -> bool:
+    chat_id = owner_id(load_access())
+    if not chat_id:
+        return False
+    try:
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Профиль <code>{name}</code>: токен не обновляется — перелогиньте: <code>/login {name}</code>",
+            parse_mode="HTML",
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"dead profile notify failed: {e}")
+        return False
+
+
+async def keepalive_once(now: float, bot: Bot | None = None) -> dict[str, str]:
+    """Один проход keepalive: обновляем неактивные профили, у которых токен скоро истечёт.
+
+    Текущий профиль и профили с тем же refreshToken, что у активного входа, пропускаем.
+    Браузерный путь (Playwright) не используем. Возвращает {имя: статус}.
+    """
+    cur = current_profile_name()
+    active_refresh = _account_identity(_active_claude_json_path(), _active_creds_path())["refresh"]
+    deadline_ms = int(now * 1000) + PROFILE_KEEPALIVE_WINDOW_MS
+
+    pending = []
+    for name in list_profile_names():
+        if name == cur:
+            continue
+        data = _read_json_dict(_profile_creds_path(name)) or {}
+        oauth = data.get("claudeAiOauth") if isinstance(data.get("claudeAiOauth"), dict) else {}
+        if active_refresh and oauth.get("refreshToken") == active_refresh:
+            continue
+        expires = oauth.get("expiresAt")
+        if isinstance(expires, (int, float)) and expires > deadline_ms:
+            continue  # токен живёт дольше окна — не трогаем
+        pending.append(name)
+
+    results: dict[str, str] = {}
+    dead = _load_dead_profiles()
+    dead_before = set(dead)
+    for i, name in enumerate(pending):
+        if i:
+            await asyncio.sleep(PROFILE_KEEPALIVE_GAP)
+        path = _profile_creds_path(name)
+        if time.time() < _refresh_cooldown.get(str(path), 0.0):
+            results[name] = "cooldown"
+            continue
+        status = await refresh_oauth_token(path, allow_browser=False, force=True)
+        results[name] = status
+        if status == "refreshed":
+            dead.discard(name)
+        elif status == "error" and name not in dead:
+            if bot is not None and await _notify_dead_profile(bot, name):
+                dead.add(name)
+    if dead != dead_before:
+        _save_dead_profiles(dead)
+    return results
+
+
+async def profile_sync_loop(shutdown_evt: asyncio.Event, bot: Bot) -> None:
+    """Раз в минуту: если активный .credentials.json сменился (ротация токенов), переносим его в профиль."""
+    last_mtime = None
+    while not shutdown_evt.is_set():
+        try:
+            path = _active_creds_path()
+            if path.exists() and _read_json_dict(path) is not None:
+                mtime = path.stat().st_mtime
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    name = sync_active_to_profile()
+                    if name:
+                        log(f"active credentials synced to profile {name}")
+        except Exception as e:  # noqa: BLE001
+            log(f"profile sync error: {e}")
+        try:
+            await asyncio.wait_for(shutdown_evt.wait(), timeout=PROFILE_SYNC_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            break
+
+
+async def profile_keepalive_loop(shutdown_evt: asyncio.Event, bot: Bot) -> None:
+    """Раз в 30 минут поддерживаем неактивные профили живыми (см. keepalive_once)."""
+    try:
+        await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        return
+    while not shutdown_evt.is_set():
+        try:
+            await keepalive_once(time.time(), bot)
+        except Exception as e:  # noqa: BLE001
+            log(f"profile keepalive error: {e}")
+        try:
+            await asyncio.wait_for(shutdown_evt.wait(), timeout=PROFILE_KEEPALIVE_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            break
+
+
 @dp.message(Command("switch_account"))
 async def cmd_switch_account(msg: Message) -> None:
     gated = dm_command_gate(msg)
@@ -3812,14 +4108,18 @@ async def cmd_switch_account(msg: Message) -> None:
         return
         
     name = args[1].strip()
-    target_credentials = (USER_HOME / ".claude" / f".credentials.{name}.json")
-    target_claude_json = (USER_HOME / f".claude.{name}.json")
+    target_credentials = _profile_creds_path(name)
+    target_claude_json = _profile_claude_json_path(name)
     
     if not target_credentials.exists():
         await msg.answer(f"{EMOJI_WARNING} Профиль <code>{name}</code> не найден. Используйте <code>/accounts</code> для просмотра списка.", parse_mode="HTML")
         return
         
     try:
+        # Сначала переносим свежие (ротированные) токены текущего аккаунта в его профиль,
+        # иначе после переключения его refresh token уже мёртв.
+        sync_active_to_profile()
+
         # Пробуем обновить токен перед переключением
         await msg.answer(f"{EMOJI_REFRESH} Проверяю токен...", parse_mode="HTML")
         refresh_status = await refresh_oauth_token(target_credentials)
@@ -3840,17 +4140,13 @@ async def cmd_switch_account(msg: Message) -> None:
                 await msg.answer(f"{EMOJI_WARNING} Не удалось обновить токен. Попробуй войти заново через <code>/login {name}</code>.", parse_mode="HTML")
             return
 
-        active_credentials = (USER_HOME / ".claude" / ".credentials.json")
-        active_claude_json = (USER_HOME / ".claude.json")
+        active_credentials = _active_creds_path()
+        active_claude_json = _active_claude_json_path()
 
         write_secret(active_credentials, target_credentials.read_text("utf-8"))
-        if target_claude_json.exists():
-            write_secret(active_claude_json, target_claude_json.read_text("utf-8"))
-        else:
-            try:
-                active_claude_json.unlink()
-            except OSError:
-                pass
+        # В ~/.claude.json меняем только аккаунт: trust-флаги, mcpServers и настройки проектов сохраняем.
+        _merge_account_into_claude_json(active_claude_json, target_claude_json)
+        _set_active_profile(name)
 
         # Сбрасываем session_id – новый аккаунт не может возобновить чужую сессию.
         # Пишем sentinel "new" вместо удаления: claude-telegram-bot видит файл и
@@ -4383,9 +4679,13 @@ async def cmd_delete_account(msg: Message) -> None:
             except Exception:
                 pass
                 
+        was_current = current_profile_name() == name
         target_credentials.unlink()
         if target_claude_json.exists():
             target_claude_json.unlink()
+        _forget_dead_profile(name)
+        if was_current:
+            _set_active_profile(None)
             
         if is_active:
             try:
@@ -5091,6 +5391,8 @@ async def main() -> None:
     topic_task = None
     update_task = None
     usage_watch_task = None
+    profile_sync_task = None
+    profile_keepalive_task = None
     inbox_server = None
 
     if os.environ.get("CLAUDE_TELEGRAM_BACKGROUND") == "1":
@@ -5106,6 +5408,8 @@ async def main() -> None:
                 dp.start_polling(bot, handle_signals=False, allowed_updates=_master_allowed_updates()))
             update_task = asyncio.create_task(auto_update_loop(shutdown_evt, bot))
             usage_watch_task = asyncio.create_task(usage_watch_loop(shutdown_evt, bot))
+            profile_sync_task = asyncio.create_task(profile_sync_loop(shutdown_evt, bot))
+            profile_keepalive_task = asyncio.create_task(profile_keepalive_loop(shutdown_evt, bot))
 
     await shutdown_evt.wait()
     log("shutting down")
@@ -5147,6 +5451,10 @@ async def main() -> None:
         tasks_to_cancel.append(update_task)
     if usage_watch_task:
         tasks_to_cancel.append(usage_watch_task)
+    if profile_sync_task:
+        tasks_to_cancel.append(profile_sync_task)
+    if profile_keepalive_task:
+        tasks_to_cancel.append(profile_keepalive_task)
 
     for t in tasks_to_cancel:
         t.cancel()

@@ -42,6 +42,21 @@ def _no_real_systemctl(monkeypatch):
     yield mock
 
 
+@pytest.fixture(autouse=True)
+def _isolate_user_home(tmp_path, monkeypatch):
+    """Домашний каталог Claude (~/.claude, ~/.claude.json) — временный на каждый тест.
+
+    Команды аккаунтов (/switch_account, sync профилей) читают и пишут USER_HOME, поэтому
+    без подмены тест мог бы тронуть реальные токены.
+    """
+    import server  # noqa: WPS433
+
+    home = tmp_path / "_user_home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setattr(server, "USER_HOME", home)
+    yield home
+
+
 @pytest.fixture
 def real_systemctl(monkeypatch, _no_real_systemctl):
     """Оригинальный server._systemctl с подменённым subprocess (systemctl не запускается)."""
