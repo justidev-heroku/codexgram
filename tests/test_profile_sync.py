@@ -312,6 +312,52 @@ async def test_keepalive_dead_notified_once_then_cleared(keepalive_env, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_keepalive_blocked_is_not_dead(keepalive_env, monkeypatch):
+    async def fake_refresh(path, allow_browser=True, force=False):
+        return "blocked"
+
+    monkeypatch.setattr(server, "refresh_oauth_token", fake_refresh)
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    results = await server.keepalive_once(time.time(), bot)
+    assert set(results.values()) == {"blocked"}
+    assert bot.send_message.await_count == 0
+    assert server._load_dead_profiles() == set()
+
+
+def _fake_session(status_code):
+    class Resp:
+        def __init__(self):
+            self.status_code = status_code
+            self.headers = {}
+            self.content = b"{}"
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            return Resp()
+
+    return Session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,expected", [(400, "error"), (401, "error"), (403, "blocked"),
+                                           (429, "blocked"), (502, "blocked")])
+async def test_refresh_without_browser_classifies_status(tmp_path, monkeypatch, code, expected):
+    import curl_cffi.requests as cr
+    monkeypatch.setattr(cr, "AsyncSession", _fake_session(code))
+    path = tmp_path / ".credentials.x.json"
+    path.write_text('{"claudeAiOauth": {"refreshToken": "r", "expiresAt": 0}}', "utf-8")
+    server._refresh_cooldown.pop(str(path), None)
+    assert await server.refresh_oauth_token(path, allow_browser=False, force=True) == expected
+
+
+@pytest.mark.asyncio
 async def test_resave_clears_dead_flag(state, switch_env):
     home = server.USER_HOME
     server._save_dead_profiles({"a"})

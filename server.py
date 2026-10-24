@@ -3720,7 +3720,7 @@ async def refresh_oauth_token(creds_path: Path, allow_browser: bool = True, forc
 
     Использует curl_cffi для подмены TLS-отпечатка Chrome. Если Cloudflare блокирует запрос,
     переключается на Playwright Chromium для обхода JS-челленджа. allow_browser=False отключает
-    Playwright (тогда блокировка даёт 'error'). force=True обновляет токен, даже если он ещё живой.
+    Playwright: тогда блокировка/сбой сети/5xx дают 'blocked' (временно), а 'error' — только 400/401. force=True обновляет токен, даже если он ещё живой.
     """
     cache_key = str(creds_path)
     # Если ещё в кулдауне — не дёргаем эндпоинт
@@ -3774,6 +3774,10 @@ async def refresh_oauth_token(creds_path: Path, allow_browser: bool = True, forc
                     if retry_after > 0:
                         _refresh_cooldown[cache_key] = time.time() + retry_after
                     use_playwright = True
+                elif not allow_browser and resp.status_code not in (400, 401):
+                    # Без браузера только 400/401 (invalid_grant) значит «токен мёртв»;
+                    # 5xx и прочее — временный сбой, keepalive попробует позже.
+                    return "blocked"
                 else:
                     return "error"
         except Exception as e:
@@ -3782,7 +3786,7 @@ async def refresh_oauth_token(creds_path: Path, allow_browser: bool = True, forc
 
         # 2. Надежный путь через Playwright
         if use_playwright and not allow_browser:
-            return "error"
+            return "blocked"
         if use_playwright:
             try:
                 resp_data = await refresh_oauth_token_playwright(refresh_token)
