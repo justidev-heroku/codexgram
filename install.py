@@ -814,6 +814,7 @@ PTY_ACTIONS_MAX_AGE = 600.0
 # Live /model and /effort: wait for claude to be idle, type the command, wait for its
 # confirmation line, then restore the global settings keys the command rewrote.
 LIVE_SWITCH_TIMEOUT = 20.0
+LIVE_LATE_RESTORE_DELAY = 3.0
 LIVE_SWITCH_GIVE_UP = 300.0
 LIVE_BUSY_QUIET = 3.0
 LIVE_SCREEN_TAIL = 4000
@@ -1041,6 +1042,8 @@ def main() -> int:
     # of cleaned output (kept across the startup reset), and the last time a spinner showed.
     live_queue = []
     live_switch = None
+    # (snapshot, due): claude may rewrite settings.json just after its confirmation line.
+    live_late_restore = None
     screen_tail = ""
     last_busy_seen = 0.0
 
@@ -1137,7 +1140,11 @@ def main() -> int:
             confirmed = LIVE_CONFIRM_RE[live_switch["kind"]].search(live_switch["output"]) is not None
             if confirmed or now > live_switch["deadline"]:
                 finish_live_switch(live_switch, confirmed)
+                live_late_restore = (live_switch["snapshot"], now + LIVE_LATE_RESTORE_DELAY)
                 live_switch = None
+        if live_late_restore is not None and now >= live_late_restore[1]:
+            restore_settings_keys(live_settings_path(), live_late_restore[0])
+            live_late_restore = None
 
         if fd in r:
             try:
