@@ -735,9 +735,9 @@ def detect_startup_dialog(buf: str):
 # which server.py turns into a "safeguard:switch" line in STATE_DIR/pty_action.
 SAFEGUARD_NEEDLE = "safeguardsflaggedthissession"
 SAFEGUARD_STOP_NEEDLE = "safeguardsstoppedtheresponseabove"
-# Keys that choose option 1 ("Switch to Opus 4.8") in the PTY menu.
-# UNVERIFIED against the live dialog: "1" may already select, "\r" confirms.
-SAFEGUARD_SWITCH_KEYS = [b"1", b"\r"]
+# Keys that choose option 1 ("Switch to Opus 4.8"): the cursor (❯) already sits
+# on option 1, so Enter confirms it without a stray digit leaking into the prompt.
+SAFEGUARD_SWITCH_KEYS = [b"\r"]
 SAFEGUARD_KEY_DELAY = 0.3
 SAFEGUARD_ACTION_MAX_AGE = 600.0
 SAFEGUARD_STOP_COOLDOWN = 60.0
@@ -932,7 +932,10 @@ def main() -> int:
             break
 
         # Owner's button press from server.py; checked every iteration, select timeouts included.
-        pty_keys = consume_pty_action(STATE_DIR / "pty_action", safeguard_pending, time.time())
+        # Re-check the screen so a late press never lands in a normal prompt.
+        pty_keys = consume_pty_action(STATE_DIR / "pty_action",
+                                      safeguard_pending and detect_safeguard_pause(pty_buffer) is not None,
+                                      time.time())
         if pty_keys:
             try:
                 for chunk in pty_keys:

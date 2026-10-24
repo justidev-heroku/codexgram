@@ -153,7 +153,7 @@ def test_switch_with_pending_returns_keys_and_deletes_file(tmp_path):
     f = tmp_path / "pty_action"
     f.write_text("safeguard:switch", "utf-8")
     keys = consume_pty_action(f, True, time.time())
-    assert keys == SAFEGUARD_SWITCH_KEYS == [b"1", b"\r"]
+    assert keys == SAFEGUARD_SWITCH_KEYS == [b"\r"]
     assert not f.exists()
 
 
