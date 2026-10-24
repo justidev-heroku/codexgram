@@ -499,3 +499,13 @@ def test_enqueue_writes_one_file_per_action(state):
     server.enqueue_pty_action("set_effort:max")
     assert _queued(state) == ["set_effort:low", "set_effort:max"]
     assert not list((state / "pty_actions").glob(".*.tmp"))
+
+
+def test_switch_model_dialog_detected_with_and_without_spaces():
+    f = NS["detect_switch_model_dialog"]
+    real = ("Switch model? Your next response will be slower and use more tokens This conversation "
+            "i cached for th curr nt model. ❯ 1. Yes, switch to Opus 4.8 2. No, go back")
+    assert f(real)
+    assert f(real.replace(" ", ""))
+    assert not f("❯ /model claude-opus-4-8 ⎿ Set model to Opus 4.8 and saved as your default")
+    assert not f("Should I switch model? yes")

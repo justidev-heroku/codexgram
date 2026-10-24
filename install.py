@@ -907,6 +907,13 @@ def live_settings_path():
     return Path.home() / ".claude" / "settings.json"
 
 
+def detect_switch_model_dialog(buf: str) -> bool:
+    # "Switch model? ... ❯ 1. Yes, switch to Opus 4.8 2. No, go back" shown by /model
+    # when the conversation is cached for the current model. Pure.
+    norm = re.sub(r"\s+", "", buf).lower()
+    return "switchmodel?" in norm and "yes,switchto" in norm
+
+
 def start_live_switch(kind, value, fd, now):
     # Snapshot the global settings, then type "/model <id>" or "/effort <level>" + Enter
     # into the idle prompt, one char at a time. Returns the in-flight state.
@@ -1136,6 +1143,16 @@ def main() -> int:
                 live_queue.pop(0)
                 send_telegram_alert("⚠️ Не удалось применить без перезапуска (Claude занят). "
                                     "Изменение применится при следующем перезапуске.")
+        if live_switch is not None and not live_switch.get("dialog_answered") and \
+                detect_switch_model_dialog(live_switch["output"]):
+            # Sessions with history ask "Switch model? ... 1. Yes, switch to X"; the
+            # cursor sits on "Yes" and the owner already chose, so confirm it.
+            try:
+                os.write(fd, b"\r")
+            except OSError:
+                pass
+            live_switch["dialog_answered"] = True
+            live_switch["deadline"] = now + LIVE_SWITCH_TIMEOUT
         if live_switch is not None:
             confirmed = LIVE_CONFIRM_RE[live_switch["kind"]].search(live_switch["output"]) is not None
             if confirmed or now > live_switch["deadline"]:
