@@ -200,6 +200,12 @@ def state(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _queued(state):
+    # Action lines the callbacks queued for the launcher (STATE_DIR/pty_actions/*.act).
+    d = state / "pty_actions"
+    return [f.read_text("utf-8").strip() for f in sorted(d.glob("*.act"))] if d.exists() else []
+
+
 def _cb(uid):
     cb = MagicMock()
     cb.from_user = SimpleNamespace(id=int(uid), username=None, first_name="N", last_name=None, is_bot=False)
@@ -212,8 +218,7 @@ def _cb(uid):
 def test_switch_callback_writes_pty_action_for_owner(state):
     cb = _cb(OWNER)
     asyncio.run(server.on_safeguard_switch(cb))
-    assert (state / "pty_action").read_text("utf-8") == "safeguard:switch"
-    assert not (state / "pty_action.tmp").exists()
+    assert _queued(state) == ["safeguard:switch"]
     cb.message.edit_text.assert_awaited_once()
     assert "Переключаю" in cb.message.edit_text.await_args.args[0]
     cb.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
@@ -222,7 +227,7 @@ def test_switch_callback_writes_pty_action_for_owner(state):
 def test_switch_callback_denied_for_guest_writes_nothing(state):
     cb = _cb(GUEST)
     asyncio.run(server.on_safeguard_switch(cb))
-    assert not (state / "pty_action").exists()
+    assert _queued(state) == []
     cb.answer.assert_awaited_once_with("Нет доступа.")
     cb.message.edit_text.assert_not_awaited()
 

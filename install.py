@@ -773,6 +773,12 @@ def detect_safeguard_stop(buf: str) -> bool:
     return SAFEGUARD_STOP_NEEDLE in re.sub(r"\s+", "", buf).lower()
 
 
+def safeguard_stop_alert_due(startup_cleared: bool, now: float, last: float) -> bool:
+    # Lines replayed while resuming history are not news: alert only after startup
+    # has cleared, and at most once per cooldown. Pure.
+    return bool(startup_cleared) and now - last > SAFEGUARD_STOP_COOLDOWN
+
+
 def consume_pty_action(path, pending: bool, now: float):
     # Read and delete the bot -> launcher control file. Returns SAFEGUARD_SWITCH_KEYS
     # when the owner asked to switch while a safeguard pause is pending, else None.
@@ -796,6 +802,147 @@ def consume_pty_action(path, pending: bool, now: float):
     if action == "safeguard:switch" and pending:
         return list(SAFEGUARD_SWITCH_KEYS)
     return None
+
+
+# Queued control actions. server.py writes one file per action into STATE_DIR/pty_actions/
+# (name <time_ns>.act, content one line, written via tmp + os.replace). The old single
+# STATE_DIR/pty_action file is still read as one more action.
+PTY_ACTIONS_DIR_NAME = "pty_actions"
+PTY_ACTION_RE = re.compile(
+    r"safeguard:switch|new_session|set_model:[A-Za-z0-9._-]+|set_effort:(?:low|medium|high|xhigh|max|auto)")
+PTY_ACTIONS_MAX_AGE = 600.0
+# Live /model and /effort: wait for claude to be idle, type the command, wait for its
+# confirmation line, then restore the global settings keys the command rewrote.
+LIVE_SWITCH_TIMEOUT = 20.0
+LIVE_SWITCH_GIVE_UP = 300.0
+LIVE_BUSY_QUIET = 3.0
+LIVE_SCREEN_TAIL = 4000
+LIVE_SETTINGS_KEYS = ("model", "effortLevel", "modelSettings")
+LIVE_CONFIRM_RE = {
+    "set_model": re.compile(r"set\s*model\s*to", re.I),
+    "set_effort": re.compile(r"set\s*effort\s*level\s*to", re.I),
+}
+LIVE_MODEL_NAME_RE = re.compile(r"set\s*model\s*to\s+(.{1,60}?)\s+and\s+saved", re.I | re.S)
+
+
+def read_pty_actions(actions_dir, now, legacy_path=None):
+    # Pop every queued action file (oldest first) and return the valid action lines.
+    # Files older than PTY_ACTIONS_MAX_AGE and malformed lines are dropped; all are deleted.
+    actions = []
+    if legacy_path is not None and consume_pty_action(legacy_path, True, now):
+        actions.append("safeguard:switch")
+    for path in sorted(Path(actions_dir).glob("*.act")):
+        text, age = "", 0.0
+        try:
+            age = now - path.stat().st_mtime
+            text = path.read_text("utf-8").strip()
+        except OSError:
+            pass
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if age <= PTY_ACTIONS_MAX_AGE and PTY_ACTION_RE.fullmatch(text):
+            actions.append(text)
+    return actions
+
+
+def is_idle_prompt(buf: str) -> bool:
+    # True when claude sits at its input prompt: the last "❯" on screen has no
+    # "esc to interrupt" (spinner) or permission options after it, and no dialog is up.
+    # Works on whitespace-stripped lowercase text (spaces may be lost after ANSI cleanup).
+    norm = re.sub(r"\s+", "", buf).lower()
+    last = norm.rfind("❯")
+    if last == -1:
+        return False
+    tail = norm[last:]
+    if "esctointerrupt" in tail or "1.yes" in tail:
+        return False
+    if detect_safeguard_pause(buf) is not None or _match_startup_dialog(buf) is not None:
+        return False
+    return True
+
+
+def snapshot_settings_keys(path):
+    # Values of LIVE_SETTINGS_KEYS present in settings.json; absent keys are left out.
+    # None when the file exists but cannot be read as a JSON object (restore then does nothing).
+    p = Path(path)
+    try:
+        data = json.loads(p.read_text("utf-8")) if p.exists() else {}
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {k: data[k] for k in LIVE_SETTINGS_KEYS if k in data}
+
+
+def restore_settings_keys(path, snap) -> bool:
+    # Put LIVE_SETTINGS_KEYS back to snap (a key missing from snap is removed again).
+    # Every other key is left as it is. Written via tmp + os.replace.
+    if snap is None:
+        return False
+    p = Path(path)
+    try:
+        data = json.loads(p.read_text("utf-8")) if p.exists() else {}
+        if not isinstance(data, dict):
+            return False
+        before = dict(data)
+        for k in LIVE_SETTINGS_KEYS:
+            if k in snap:
+                data[k] = snap[k]
+            else:
+                data.pop(k, None)
+        if data == before:
+            return True
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", "utf-8")
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+
+def live_settings_path():
+    return Path.home() / ".claude" / "settings.json"
+
+
+def start_live_switch(kind, value, fd, now):
+    # Snapshot the global settings, then type "/model <id>" or "/effort <level>" + Enter
+    # into the idle prompt, one char at a time. Returns the in-flight state.
+    snap = snapshot_settings_keys(live_settings_path())
+    command = f"/{'model' if kind == 'set_model' else 'effort'} {value}"
+    try:
+        for ch in command:
+            os.write(fd, ch.encode("utf-8"))
+            time.sleep(0.03)
+        time.sleep(0.5)
+        os.write(fd, b"\r")
+    except OSError:
+        pass
+    return {"kind": kind, "value": value, "snapshot": snap,
+            "deadline": now + LIVE_SWITCH_TIMEOUT, "output": ""}
+
+
+def finish_live_switch(live, ok: bool) -> None:
+    # Always restore the settings keys the typed command may have rewritten, then report.
+    restore_settings_keys(live_settings_path(), live["snapshot"])
+    if not ok:
+        send_telegram_alert(
+            "⚠️ Не получилось переключить на лету — нажмите «Перезапустить», чтобы применить.",
+            reply_markup={"inline_keyboard": [[
+                {"text": "Перезапустить сейчас", "callback_data": "restart_confirm"}]]})
+        return
+    if live["kind"] == "set_model":
+        try:
+            LAST_MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            LAST_MODEL_FILE.write_text(live["value"], "utf-8")
+        except Exception:
+            pass
+        m = LIVE_MODEL_NAME_RE.search(live["output"])
+        name = re.sub(r"[^A-Za-z0-9 .\-]", "", m.group(1)).strip() if m else ""
+        send_telegram_alert(f"✅ Модель переключена на {name or live['value']} без перезапуска")
+    else:
+        send_telegram_alert(f"✅ Effort переключён на {live['value']} без перезапуска")
 
 
 def main() -> int:
@@ -890,7 +1037,17 @@ def main() -> int:
         os.execvp(claude_bin, cmd)
         os._exit(127)
 
+    # Live switch state: queued set_model/set_effort actions, the one in flight, the tail
+    # of cleaned output (kept across the startup reset), and the last time a spinner showed.
+    live_queue = []
+    live_switch = None
+    screen_tail = ""
+    last_busy_seen = 0.0
+
     def sig_handler(signum, frame):
+        # Never leave the global settings rewritten by a half-finished live switch.
+        if live_switch is not None:
+            restore_settings_keys(live_settings_path(), live_switch["snapshot"])
         try:
             os.kill(pid, signal.SIGTERM)
             time.sleep(0.5)
@@ -931,24 +1088,56 @@ def main() -> int:
         except (OSError, ValueError):
             break
 
-        # Owner's button press from server.py; checked every iteration, select timeouts included.
-        # Re-check the screen so a late press never lands in a normal prompt.
-        pty_keys = consume_pty_action(STATE_DIR / "pty_action",
-                                      safeguard_pending and detect_safeguard_pause(pty_buffer) is not None,
-                                      time.time())
-        if pty_keys:
-            try:
-                for chunk in pty_keys:
-                    os.write(fd, chunk)
-                    time.sleep(SAFEGUARD_KEY_DELAY)
-            except OSError:
-                pass
-            safeguard_pending = False
-            # Drop the dialog text so it is not treated as a new pause.
-            pty_buffer = re.sub(r"\s*".join(["safeguards", "flagged", "this", "session"]),
-                                "[processed_safeguard]", pty_buffer, flags=re.IGNORECASE)
-            sys.stderr.write("safeguard pause: switch selected from Telegram\n")
-            sys.stderr.flush()
+        # Owner's actions from server.py; checked every iteration, select timeouts included.
+        now = time.time()
+        for action in read_pty_actions(STATE_DIR / PTY_ACTIONS_DIR_NAME, now, STATE_DIR / "pty_action"):
+            if action == "safeguard:switch":
+                # Re-check the screen so a late press never lands in a normal prompt.
+                if safeguard_pending and detect_safeguard_pause(pty_buffer) is not None:
+                    try:
+                        for chunk in SAFEGUARD_SWITCH_KEYS:
+                            os.write(fd, chunk)
+                            time.sleep(SAFEGUARD_KEY_DELAY)
+                    except OSError:
+                        pass
+                    safeguard_pending = False
+                    # Drop the dialog text so it is not treated as a new pause.
+                    pty_buffer = re.sub(r"\s*".join(["safeguards", "flagged", "this", "session"]),
+                                        "[processed_safeguard]", pty_buffer, flags=re.IGNORECASE)
+                    sys.stderr.write("safeguard pause: switch selected from Telegram\n")
+                    sys.stderr.flush()
+            elif action == "new_session":
+                # Claude is stopped on purpose; the systemd unit starts a fresh session.
+                try:
+                    (STATE_DIR / "active_session_id").write_text("new", encoding="utf-8")
+                except Exception:
+                    pass
+                forked_session_captured = True
+                live_queue.clear()
+                send_telegram_alert("🆕 Начинаю новую сессию…")
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
+            else:
+                live_queue.append((action, now))
+
+        # Live set_model / set_effort: start one when claude is idle, give up after a while.
+        if live_queue and live_switch is None and now - process_start_time > 8.0:
+            action, queued_at = live_queue[0]
+            if is_idle_prompt(screen_tail) and now - last_busy_seen > LIVE_BUSY_QUIET:
+                live_queue.pop(0)
+                kind, value = action.split(":", 1)
+                live_switch = start_live_switch(kind, value, fd, time.time())
+            elif now - queued_at > LIVE_SWITCH_GIVE_UP:
+                live_queue.pop(0)
+                send_telegram_alert("⚠️ Не удалось применить без перезапуска (Claude занят). "
+                                    "Изменение применится при следующем перезапуске.")
+        if live_switch is not None:
+            confirmed = LIVE_CONFIRM_RE[live_switch["kind"]].search(live_switch["output"]) is not None
+            if confirmed or now > live_switch["deadline"]:
+                finish_live_switch(live_switch, confirmed)
+                live_switch = None
 
         if fd in r:
             try:
@@ -973,6 +1162,11 @@ def main() -> int:
             pty_buffer += clean_data
             if len(pty_buffer) > 10000:
                 pty_buffer = pty_buffer[-10000:]
+            screen_tail = (screen_tail + clean_data)[-LIVE_SCREEN_TAIL:]
+            if "esctointerrupt" in re.sub(r"\s+", "", clean_data).lower():
+                last_busy_seen = time.time()
+            if live_switch is not None:
+                live_switch["output"] += clean_data
 
             hit = _match_startup_dialog(pty_buffer)
             if hit:
@@ -1007,6 +1201,7 @@ def main() -> int:
                     reply_markup={"inline_keyboard": [
                         [{"text": f"🔄 Переключить на {safeguard['fallback']}", "callback_data": "safeguard:switch"}],
                         [{"text": "✋ Оставить на паузе", "callback_data": "safeguard:ack"}],
+                        [{"text": "🆕 Новая сессия", "callback_data": "safeguard:new"}],
                     ]})
 
             if detect_safeguard_stop(pty_buffer):
@@ -1014,7 +1209,7 @@ def main() -> int:
                 pty_buffer = re.sub(r"\s*".join(["safeguards", "stopped", "the", "response", "above"]),
                                     "[processed_safeguard_stop]", pty_buffer, flags=re.IGNORECASE)
                 stop_now = time.time()
-                if stop_now - safeguard_stop_last > SAFEGUARD_STOP_COOLDOWN:
+                if safeguard_stop_alert_due(startup_cleared, stop_now, safeguard_stop_last):
                     send_telegram_alert("🛡 Фильтры Opus 5.5 остановили ответ; Claude продолжает с учётом этого.")
                     safeguard_stop_last = stop_now
 
@@ -1125,6 +1320,8 @@ def main() -> int:
                                     "invalid authentication credentials", "api error: 401", "please run /login"]:
                         pty_buffer = re.sub(re.escape(keyword), f"[processed_{keyword}]", pty_buffer, flags=re.IGNORECASE)
 
+    if live_switch is not None:
+        restore_settings_keys(live_settings_path(), live_switch["snapshot"])
     _, status = os.waitpid(pid, 0)
     if auth_failed:
         time.sleep(30)

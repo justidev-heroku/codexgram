@@ -280,6 +280,26 @@ def write_setting(key: str, value) -> None:
     except Exception as e:
         log(f"write_setting failed: {e}")
 
+
+def read_switch_on_flag() -> bool:
+    # switchModelsOnFlag in this instance's settings: claude falls back to another model when
+    # Opus safeguards flag the session. Default off.
+    try:
+        return orjson.loads(SETTINGS_FILE.read_bytes()).get("switchModelsOnFlag") is True
+    except Exception:
+        return False
+
+
+def enqueue_pty_action(action: str) -> None:
+    # Queue a control action for this instance's PTY launcher (install.py WRAPPER_TEMPLATE
+    # reads STATE_DIR/pty_actions/). One file per action, written via tmp + os.replace.
+    d = STATE_DIR / "pty_actions"
+    d.mkdir(parents=True, exist_ok=True)
+    name = f"{time.time_ns()}.act"
+    tmp = d / f".{name}.tmp"
+    tmp.write_text(action + "\n", encoding="utf-8")
+    os.replace(tmp, d / name)
+
 bot = Bot(TOKEN, default=DefaultBotProperties())
 dp = Dispatcher()
 bot_username = ""
@@ -2418,12 +2438,26 @@ async def cmd_model(msg: Message) -> None:
         return
 
     access = gated["access"]
+    kb = model_menu_markup(current_model_alias(access))
+    await bot.send_message(
+        msg.chat.id,
+        f"<b>{EMOJI_GEAR} Выберите модель Claude Code:</b>\nПрименится сразу, если Claude свободен, иначе при перезапуске.",
+        parse_mode="HTML",
+        reply_markup=kb,
+        **thread_kwargs(msg.chat.id),
+    )
+
+
+def current_model_alias(access: dict) -> str:
     alias_by_full = {full: a for a, full, _ in get_models()}
     try:
         raw = orjson.loads(SETTINGS_FILE.read_bytes()).get("model")
-        current = alias_by_full.get(raw, raw) or access.get("model", "sonnet")
+        return alias_by_full.get(raw, raw) or access.get("model", "sonnet")
     except Exception:
-        current = access.get("model", "sonnet")
+        return access.get("model", "sonnet")
+
+
+def model_menu_markup(current: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
             text=display,
@@ -2433,19 +2467,30 @@ async def cmd_model(msg: Message) -> None:
         )]
         for alias, _, display in get_models()
     ]
+    on = read_switch_on_flag()
+    rows.append([InlineKeyboardButton(
+        text=f"🛡 Авто-переход при флаге: {'вкл' if on else 'выкл'}",
+        callback_data="mdl:sgauto", style="success" if on else "primary")])
     rows.append([InlineKeyboardButton(
         text="➕ Добавить модель", callback_data="mdl:add", style="primary")])
     if load_custom_models():
         rows.append([InlineKeyboardButton(
             text="🗑 Удалить модель", callback_data="mdl:manage", style="danger")])
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await bot.send_message(
-        msg.chat.id,
-        f"<b>{EMOJI_GEAR} Выберите модель Claude Code:</b>\nВступит в силу после перезапуска.",
-        parse_mode="HTML",
-        reply_markup=kb,
-        **thread_kwargs(msg.chat.id),
-    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "mdl:sgauto")
+async def on_model_sgauto(cb: CallbackQuery) -> None:
+    if not owner_gate_cb(cb):
+        await cb.answer("Нет доступа.")
+        return
+    on = not read_switch_on_flag()
+    write_setting("switchModelsOnFlag", on)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=model_menu_markup(current_model_alias(load_access())))
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer("Авто-переход при флаге включён" if on else "Авто-переход при флаге выключен")
 
 
 @dp.callback_query(F.data.startswith("model:"))
@@ -2464,6 +2509,13 @@ async def on_model_callback(cb: CallbackQuery) -> None:
     access = load_access()
     access["model"] = alias
     save_access(access)
+    # Saved above, so a restart keeps it; the launcher also switches the running claude now.
+    try:
+        enqueue_pty_action(f"set_model:{model_map[alias]}")
+        status = "⏳ Применяю без перезапуска…"
+    except Exception as e:  # noqa: BLE001
+        log(f"enqueue set_model failed: {e}")
+        status = "Перезапустите бота, чтобы применить настройки."
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="Перезапустить сейчас",
@@ -2476,7 +2528,7 @@ async def on_model_callback(cb: CallbackQuery) -> None:
         f"<b>{EMOJI_SUCCESS} Модель сохранена успешно</b>\n\n"
         f"<blockquote><b>Модель:</b> <code>{display_map[alias]}</code>\n"
         f"<b>Алиас:</b> <code>{model_map[alias]}</code></blockquote>\n"
-        f"Перезапустите бота, чтобы применить настройки.",
+        f"{status}",
         parse_mode="HTML",
         reply_markup=kb,
     )
@@ -2588,6 +2640,12 @@ async def on_effort_callback(cb: CallbackQuery) -> None:
     access = load_access()
     access["effortLevel"] = level
     save_access(access)
+    try:
+        enqueue_pty_action(f"set_effort:{level}")
+        status = "⏳ Применяю без перезапуска…"
+    except Exception as e:  # noqa: BLE001
+        log(f"enqueue set_effort failed: {e}")
+        status = "Перезапустите бота, чтобы применить настройки."
     label_map = dict(EFFORT_LEVELS)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -2600,7 +2658,7 @@ async def on_effort_callback(cb: CallbackQuery) -> None:
     await cb.message.edit_text(
         f"<b>{EMOJI_SUCCESS} Уровень effort сохранён</b>\n\n"
         f"<blockquote><b>Текущий уровень:</b> <code>{label_map[level]}</code></blockquote>\n"
-        f"Перезапустите бота, чтобы применить настройки.",
+        f"{status}",
         parse_mode="HTML",
         reply_markup=kb,
     )
@@ -4493,14 +4551,10 @@ async def on_safeguard_switch(cb: CallbackQuery) -> None:
         await cb.answer("Нет доступа.")
         return
     # Hand the choice to the launcher, which presses the option keys in the PTY.
-    # Written via tmp + os.replace so the launcher never reads a half-written file.
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp_path = STATE_DIR / "pty_action.tmp"
-        tmp_path.write_text("safeguard:switch", encoding="utf-8")
-        os.replace(tmp_path, STATE_DIR / "pty_action")
+        enqueue_pty_action("safeguard:switch")
     except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"safeguard switch: cannot write pty_action: {e}\n")
+        sys.stderr.write(f"safeguard switch: cannot queue action: {e}\n")
         await cb.answer("Не удалось передать команду.", show_alert=True)
         return
     try:
@@ -4512,6 +4566,28 @@ async def on_safeguard_switch(cb: CallbackQuery) -> None:
     except Exception:  # noqa: BLE001
         pass
     await cb.answer("Переключаю")
+
+
+@dp.callback_query(F.data == "safeguard:new")
+async def on_safeguard_new(cb: CallbackQuery) -> None:
+    if not owner_gate_cb(cb):
+        await cb.answer("Нет доступа.")
+        return
+    try:
+        enqueue_pty_action("new_session")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"safeguard new session: cannot queue action: {e}\n")
+        await cb.answer("Не удалось передать команду.", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text("🆕 Начинаю новую сессию…", parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer("Новая сессия")
 
 
 @dp.callback_query(F.data == "safeguard:ack")
