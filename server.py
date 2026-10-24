@@ -4487,6 +4487,49 @@ async def on_limit_resume(cb: CallbackQuery) -> None:
     await cb.answer("Возобновляю")
 
 
+@dp.callback_query(F.data == "safeguard:switch")
+async def on_safeguard_switch(cb: CallbackQuery) -> None:
+    if not owner_gate_cb(cb):
+        await cb.answer("Нет доступа.")
+        return
+    # Hand the choice to the launcher, which presses the option keys in the PTY.
+    # Written via tmp + os.replace so the launcher never reads a half-written file.
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_path = STATE_DIR / "pty_action.tmp"
+        tmp_path.write_text("safeguard:switch", encoding="utf-8")
+        os.replace(tmp_path, STATE_DIR / "pty_action")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"safeguard switch: cannot write pty_action: {e}\n")
+        await cb.answer("Не удалось передать команду.", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text("🔄 Переключаю на Opus 4.8…", parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer("Переключаю")
+
+
+@dp.callback_query(F.data == "safeguard:ack")
+async def on_safeguard_ack(cb: CallbackQuery) -> None:
+    if not owner_gate_cb(cb):
+        await cb.answer("Нет доступа.")
+        return
+    try:
+        await cb.message.edit_text("✋ Сессия оставлена на паузе. Можно сменить модель через /model.", parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer("Понял")
+
+
 @dp.message(Command("close"))
 async def cmd_delete(msg: Message) -> None:
     gated = dm_command_gate(msg)

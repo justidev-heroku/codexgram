@@ -730,6 +730,74 @@ def detect_startup_dialog(buf: str):
     return list(hit[1]) if hit else None
 
 
+# Opus 5.5 safeguard pause ("Session paused ... safeguards flagged this session").
+# Never answered automatically: the owner picks an action via the alert buttons,
+# which server.py turns into a "safeguard:switch" line in STATE_DIR/pty_action.
+SAFEGUARD_NEEDLE = "safeguardsflaggedthissession"
+SAFEGUARD_STOP_NEEDLE = "safeguardsstoppedtheresponseabove"
+# Keys that choose option 1 ("Switch to Opus 4.8") in the PTY menu.
+# UNVERIFIED against the live dialog: "1" may already select, "\r" confirms.
+SAFEGUARD_SWITCH_KEYS = [b"1", b"\r"]
+SAFEGUARD_KEY_DELAY = 0.3
+SAFEGUARD_ACTION_MAX_AGE = 600.0
+SAFEGUARD_STOP_COOLDOWN = 60.0
+
+
+def detect_safeguard_pause(buf: str):
+    # Pause dialog info when a FRESH safeguard dialog is in buf, else None. Pure.
+    # Works on whitespace-stripped lowercase text (spaces may be lost after ANSI cleanup).
+    # Freshness: the dialog's own "❯" cursor sits inside the dialog, so we only treat it
+    # as stale when a prompt shows up after its option list ("...retrywith<model>").
+    norm = re.sub(r"\s+", "", buf).lower()
+    last = norm.rfind(SAFEGUARD_NEEDLE)
+    if last == -1:
+        return None
+    tail = norm[last:]
+    end = tail.find("retrywith")
+    if end == -1:
+        # Options not drawn yet: fresh unless a second prompt already appeared.
+        if tail.count("❯") > 1:
+            return None
+    elif "❯" in tail[end:]:
+        return None
+    m = re.search(r"details:`\[([a-z0-9_-]*)\]`", tail)
+    category = m.group(1) if m else ""
+    m = re.search(r"switchto([a-z]+)(\d+\.\d)", tail) or re.search(r"continuewith([a-z]+)(\d+\.\d)", tail)
+    # Single-digit minor version: "Opus4.82." is "Opus 4.8" followed by option "2.".
+    fallback = f"{m.group(1).capitalize()} {m.group(2)}" if m else "Opus 4.8"
+    return {"category": category, "fallback": fallback}
+
+
+def detect_safeguard_stop(buf: str) -> bool:
+    # Inline "● Opus 5.5's safeguards stopped the response above ..." line. Pure.
+    return SAFEGUARD_STOP_NEEDLE in re.sub(r"\s+", "", buf).lower()
+
+
+def consume_pty_action(path, pending: bool, now: float):
+    # Read and delete the bot -> launcher control file. Returns SAFEGUARD_SWITCH_KEYS
+    # when the owner asked to switch while a safeguard pause is pending, else None.
+    # The file is always deleted; files older than SAFEGUARD_ACTION_MAX_AGE are ignored.
+    path = Path(path)
+    if not path.exists():
+        return None
+    action = ""
+    age = 0.0
+    try:
+        action = path.read_text("utf-8").strip()
+        age = now - path.stat().st_mtime
+    except Exception:
+        pass
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    if age > SAFEGUARD_ACTION_MAX_AGE:
+        return None
+    if action == "safeguard:switch" and pending:
+        return list(SAFEGUARD_SWITCH_KEYS)
+    return None
+
+
 def main() -> int:
     guest_uid = parse_args(sys.argv[1:])
     os.environ["CLAUDE_TELEGRAM_BACKGROUND"] = "1"
@@ -847,6 +915,8 @@ def main() -> int:
     process_start_time = time.time()
     startup_cleared = False
     forked_session_captured = not fork_for_model_change
+    safeguard_pending = False
+    safeguard_stop_last = 0.0
 
     log_file = None
     try:
@@ -860,6 +930,23 @@ def main() -> int:
             r, _, _ = select.select([fd], [], [], 1.0)
         except (OSError, ValueError):
             break
+
+        # Owner's button press from server.py; checked every iteration, select timeouts included.
+        pty_keys = consume_pty_action(STATE_DIR / "pty_action", safeguard_pending, time.time())
+        if pty_keys:
+            try:
+                for chunk in pty_keys:
+                    os.write(fd, chunk)
+                    time.sleep(SAFEGUARD_KEY_DELAY)
+            except OSError:
+                pass
+            safeguard_pending = False
+            # Drop the dialog text so it is not treated as a new pause.
+            pty_buffer = re.sub(r"\s*".join(["safeguards", "flagged", "this", "session"]),
+                                "[processed_safeguard]", pty_buffer, flags=re.IGNORECASE)
+            sys.stderr.write("safeguard pause: switch selected from Telegram\n")
+            sys.stderr.flush()
+
         if fd in r:
             try:
                 data = os.read(fd, 65536)
@@ -901,6 +988,32 @@ def main() -> int:
                     sys.stderr.write(f"auto-answered startup dialog: {dialog_needle}\n")
                     sys.stderr.flush()
                     pty_buffer = ""
+
+            # Opus safeguard pause: one alert per dialog, nothing pressed automatically.
+            # safeguard_pending clears only when the dialog is no longer the last thing on screen.
+            safeguard = detect_safeguard_pause(pty_buffer)
+            if safeguard is None:
+                safeguard_pending = False
+            elif not safeguard_pending:
+                safeguard_pending = True
+                cat_part = f" (категория: <code>{safeguard['category']}</code>)" if safeguard["category"] else ""
+                delete_thinking_message()
+                send_telegram_alert(
+                    "🛡 <b>Фильтры безопасности Opus 5.5 остановили сессию</b>" + cat_part +
+                    ". Сессия на паузе — выберите, что сделать.",
+                    reply_markup={"inline_keyboard": [
+                        [{"text": f"🔄 Переключить на {safeguard['fallback']}", "callback_data": "safeguard:switch"}],
+                        [{"text": "✋ Оставить на паузе", "callback_data": "safeguard:ack"}],
+                    ]})
+
+            if detect_safeguard_stop(pty_buffer):
+                # Scrub the inline line so it is not matched again; alert at most once per cooldown.
+                pty_buffer = re.sub(r"\s*".join(["safeguards", "stopped", "the", "response", "above"]),
+                                    "[processed_safeguard_stop]", pty_buffer, flags=re.IGNORECASE)
+                stop_now = time.time()
+                if stop_now - safeguard_stop_last > SAFEGUARD_STOP_COOLDOWN:
+                    send_telegram_alert("🛡 Фильтры Opus 5.5 остановили ответ; Claude продолжает с учётом этого.")
+                    safeguard_stop_last = stop_now
 
             if not forked_session_captured:
                 m = resume_hint_re.search(pty_buffer)
