@@ -1,5 +1,76 @@
 # DEVLOG
 
+## 2026-10-25 — codex-gram, этап 2: команды, прогресс, подтверждения, отказ от Claude-машинерии
+
+Этап 2 убирает Claude-специфику из рантайма и добавляет команды Codex поверх моста из этапа 1.
+
+**Удалено (Claude-only).** Инсталлер `install.py/.sh/.ps1`, `.claude-plugin/`, `.mcp.json`,
+`skills/`. Все Claude-пути в server.py: auto_update_loop, usage_watch_loop, profile sync и
+keepalive (OAuth-профили, которые могли ротировать токены живого Claude-бота), PTY-лаунчер
+/login и /switch_account, чтение `~/.claude` (сессии, settings.json, .credentials.json),
+модели и effort через PTY, Claude-ветка /goal (оценка через API), safeguard и limit-кнопки,
+permission relay MCP. Тесты, которые покрывали только это: test_alert_classification,
+test_install_env, test_install_fork_session, test_live_switch, test_limit_matching,
+test_model_editing, test_profile_sync, test_safeguard, test_thinking, test_new_features.
+
+**Оставлено, но не работает на codex-gram до этапа 3.** Гостевой runtime (инстансы, inbox.sock,
+systemd-юниты гостей, managed bots): гостевые апдейты отвечают заглушкой, их сообщения не
+попадают в сессию владельца. Тесты `test_guest_instance.py` и `test_managed_bots.py` помечены
+`skip` с причиной «stage 3». `test_install_guest.py` тоже помечен `skip`. `/share`, `/unshare`,
+`/access` работают как раньше (только access.json). `/mybot` отвечает заглушкой.
+
+**Команды (владелец):**
+- `/new` — `thread/start`. `/close` — `thread/archive` текущего треда и новый тред.
+- `/resume` — `thread/list` (10 последних, с давностью), кнопка → `thread/resume`.
+- `/model`, `/effort` — `model/list`; выбор в `STATE_DIR/codex_settings.json`, применяется в
+  `turn/start` со следующего хода. Effort — только из `supportedReasoningEfforts` модели.
+- `/stop` — `turn/interrupt`. `/goal` — `thread/goal/get|set|clear`.
+- `/usage` — `account/rateLimits/read`, полоски 5ч и недельного окна, сброс в МСК и относительно.
+  Фоновый алерт на `account/rateLimits/updated`: 80% и 100% один раз на окно (ключи дедупа в
+  `STATE_DIR/usage_alerts.json`, переживают рестарт).
+- `/login` — `codex login --device-auth` с `CODEX_HOME` аккаунта, URL и код из вывода (ANSI
+  вычищается), ожидание до 15 минут, по успеху — перезапуск app-server. `/logout` — `codex logout`
+  и перезапуск.
+- `/accounts`, `/save_account <имя>`, `/switch_account`, `/delete_account` — копии `auth.json` в
+  `STATE_DIR/accounts/<имя>/` (0600). Имя: `^[A-Za-z0-9_-]{1,32}$` и проверка пути после resolve.
+- `/auto` — переключает approvalPolicy `never` ↔ `on-request`. В on-request запросы
+  CommandExecution/FileChange/Permissions приходят с кнопками «Разрешить/Отклонить», без ответа
+  за 10 минут — отказ (`codex_approvals.py`).
+- `/check_update` — `codex --version` против `npm view @openai/codex version`; кнопка →
+  `npm i -g @openai/codex@latest` и перезапуск.
+- `/restart` — перезапуск дочернего app-server (сервис не трогается).
+
+**Прогресс и ходы.** Пузырь «🤖 Готовлю ответ…» собирается из `item/started|completed`
+(команды, правки файлов, MCP-вызовы, поиск), последние 5 действий с ⏳/✅/❌. Пузырь снимается
+при успешном вызове `reply`/`reply_file` и при `turn/completed`; есть предохранитель 15 минут.
+Если ход завершился `failed` или `interrupted` либо `completed` без вызова reply, владелец
+получает предупреждение с кнопками «Повторить» и «Сменить модель». Остановка через /stop
+отмечается коротко, без кнопок.
+
+**Уведомления.** `warning`, `deprecationNotice`, `model/rerouted` и ошибки без хода — владельцу,
+не чаще раза в 30 с, одинаковый текст не чаще раза в 10 минут (`Throttle`).
+
+**Инфраструктура.** Лог перенесён из `/tmp/bot_debug.log` (общий с живым Claude-ботом) в
+`STATE_DIR/bot.log`. Лог MCP-отладки — `STATE_DIR/mcp_debug.log`. CODEX_HOME для дочернего
+процесса задаётся `CODEX_GRAM_CODEX_HOME` (тесты используют временные каталоги и не трогают
+`~/.codex`). Сообщения не от владельца в сессию не передаются.
+
+**Деплой.** `deploy/codex-telegram.service` (Type=simple, Restart=always, KillMode=control-group),
+`deploy/init_access.py` (создаёт access.json с владельцем, 0600), `deploy/README.md`.
+
+**Тесты.** Новые: `test_codex_stage2.py` (настройки, аккаунты, форматирование, пузырь, ходы,
+троттлинг, алерты, брокер), `test_codex_bridge_stage2.py` (on-request, restart, resume на фейке),
+`test_codex_server_events.py` (события → пузырь/вердикты/уведомления, гости, инбаунд),
+`test_codex_sendable.py` (секреты не отправляются через reply_file), `test_init_access.py`.
+
+**Не сделано / риски.**
+- Сохранённые копии `auth.json` могут протухнуть: refresh-токены одноразовые, после обновления одной
+  копией другая становится недействительной. Перед переключением делай `/save_account`.
+- Гости и свои боты — этап 3. Персональный `~/.codex` при `/switch_account` перезаписывается.
+- `scripts/smoke_bridge.py` не запускался с живым аккаунтом (нужен реальный codex и вход).
+- Инструкции треда по-прежнему читают `codex_workflow.md` и `CODEX_GRAM_MEMORY_DIR`
+  (по умолчанию каталог памяти владельца в `~/.claude`: только чтение).
+
 ## 2026-10-25 — codex-gram, этап 1: мост к Codex CLI вместо Claude Code
 
 Форк claude-gram (`/root/claude-gram-v2`) на OpenAI Codex CLI 0.164. Репозиторий
