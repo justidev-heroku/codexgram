@@ -43,11 +43,18 @@ def test_contains_bridge_rules_workflow_and_index(tmp_path):
 
 def test_workflow_has_owner_rules_and_no_claude_only_items(tmp_path):
     text = build_developer_instructions(REPO, _mem(tmp_path))
-    for must in ("Ничего не писать", "reply", "format='html'", "sg-code-backup", "push", "pytest"):
+    for must in ("Согласование нужно только для изменений", "«да»", "«давай»", "reply", "format='html'", "sg-code-backup", "push", "pytest"):
         assert must in text, must
     lowered = text.lower()
     for banned in ("haiku", "opus", "askuserquestion", "model=\"haiku\"", "agent tool"):
         assert banned not in lowered, banned
+
+
+def test_bridge_rules_forbid_false_send_claims(tmp_path):
+    text = build_developer_instructions(REPO, _mem(tmp_path))
+    assert "Never claim that a file or message was sent" in text
+    assert "has returned success" in text
+    assert "~/.codex/generated_images" in text
 
 
 def test_memory_guide_describes_format_and_write_rules(tmp_path):
