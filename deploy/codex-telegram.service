@@ -1,0 +1,20 @@
+[Unit]
+Description=codex-gram: Telegram-мост к Codex CLI (app-server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/codex-gram
+Environment=CLAUDE_TELEGRAM_BACKGROUND=1
+Environment=TELEGRAM_STATE_DIR=/root/.codex-gram/telegram
+Environment=CODEX_GRAM_CWD=/root
+ExecStart=/usr/bin/python3 /root/codex-gram/server.py
+Restart=always
+RestartSec=5
+# codex app-server — дочерний процесс: при остановке сервиса умирает вся группа.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
