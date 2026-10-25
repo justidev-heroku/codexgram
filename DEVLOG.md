@@ -1,5 +1,32 @@
 # DEVLOG
 
+## 2026-10-25 — codex-gram, этап 1: мост к Codex CLI вместо Claude Code
+
+Форк claude-gram (`/root/claude-gram-v2`) на OpenAI Codex CLI 0.164. Репозиторий
+`/root/codex-gram`, remote удалён, пушей нет. Этап 1 — только транспорт; /model,
+прогресс-пузырь и гостевые экземпляры переделываются на следующих этапах.
+
+- Новый модуль `codex_bridge.py` (`CodexBridge`): поднимает `codex app-server`
+  (JSON-RPC 2.0 по stdio), делает handshake, хранит id активного треда в
+  `STATE_DIR/active_session_id` и возобновляет его через `thread/resume`. Если тред
+  сервер не принял, стартует новый. Сообщения уходят `turn/start`. Если ход уже идёт,
+  используется `turn/steer`. При ошибке steer сообщение ждёт `turn/completed`.
+  Server-запросы (approvals и т.п.) получают ответ сразу, без зависаний. Упавший
+  процесс перезапускается с backoff, тред возобновляется.
+- `server.py`: в фоновом режиме входящие Telegram-сообщения оборачиваются в тег
+  `<channel ...>` (как в Claude Channels) и уходят в мост. Картинки передаются как
+  `localImage`. `server.py --mcp` — MCP-стаб, который поднимает сам codex. Он
+  принудительно не поллит Telegram, иначе будет 409. Дефолтный STATE_DIR теперь
+  `~/.codex-gram/telegram`.
+- `codex_instructions.md` — developerInstructions для треда: ответ пользователю
+  только через `reply`, `chat_id` из тега, format=html, язык пользователя.
+- Токен бота в MCP-конфиг треда не кладётся: конфиг может осесть в логах сессий codex.
+- Тесты: `tests/test_codex_bridge.py` (фейковый app-server), `tests/test_codex_gram_wiring.py`.
+  `scripts/smoke_bridge.py` — прогон через настоящий `codex app-server` с MCP-стабом.
+- Известные хвосты этапа 2: Claude-специфичные пути в server.py (`.claude/channels`
+  для active_session_id в ресьюме, usage/profile-циклы, /model, /login), гостевые
+  экземпляры и часть тестов старого Claude-лаунчера пока не адаптированы.
+
 ## 2026-10-21 — Свой бот у гостя (Telegram Managed Bots)
 
 - Мастер (@ClaudeCodeExeBot, `can_manage_bots`) при /share и по /mybot шлёт гостю
