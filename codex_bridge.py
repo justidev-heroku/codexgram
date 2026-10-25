@@ -24,6 +24,8 @@ from typing import Any, Awaitable, Callable, Iterable, Optional, Sequence, Union
 from codex_settings import AUTO_ON_REQUEST, approval_policy, effort_setting, load_settings, model_setting
 
 CLIENT_INFO = {"name": "codex-gram", "version": "0.1.0"}
+# Имя сервиса в thread/start: по нему (и по превью с chat_id) отбираются треды для /resume.
+SERVICE_NAME = "codex-gram"
 SANDBOX_MODE = "danger-full-access"
 CODEX_HOME_ENV = "CODEX_GRAM_CODEX_HOME"
 APPROVAL_METHODS = frozenset({
@@ -100,6 +102,7 @@ class CodexBridge:
         log: Optional[Callable[[str], None]] = None,
         restart_backoff: tuple[float, float] = (1.0, 30.0),
         request_timeout: float = 60.0,
+        ephemeral: bool = False,
     ):
         self.state_dir = Path(state_dir)
         self.cwd = cwd
@@ -109,6 +112,7 @@ class CodexBridge:
         self._log = log or _default_log
         self._backoff_min, self._backoff_max = restart_backoff
         self._request_timeout = request_timeout
+        self.ephemeral = ephemeral
 
         self.session_file = self.state_dir / "active_session_id"
         self.thread_id: Optional[str] = None
@@ -295,7 +299,7 @@ class CodexBridge:
     async def new_thread(self) -> str:
         """Создаёт новый тред и делает его активным (сохраняется в active_session_id)."""
         async with self._turn_lock:
-            result = await self._request("thread/start", self._thread_params())
+            result = await self._request("thread/start", self._start_params())
             self._adopt_thread(result)
             self._queue.clear()
             self.active_turn_id = None
@@ -316,6 +320,13 @@ class CodexBridge:
             params["developerInstructions"] = text
         if self.mcp_servers:
             params["config"] = {"mcp_servers": self.mcp_servers}
+        return params
+
+    def _start_params(self) -> dict:
+        """Параметры thread/start: serviceName для отбора тредов в /resume, ephemeral для смоука."""
+        params = {**self._thread_params(), "serviceName": SERVICE_NAME}
+        if self.ephemeral:
+            params["ephemeral"] = True
         return params
 
     def _read_stored_id(self) -> Optional[str]:
@@ -352,7 +363,7 @@ class CodexBridge:
             except RPCError as e:
                 # Сервер ответил ошибкой: тред удалён или не открывается. Стартуем новый.
                 self._log(f"thread/resume {stored} rejected ({e}); starting a new thread")
-        result = await self._request("thread/start", self._thread_params())
+        result = await self._request("thread/start", self._start_params())
         self._adopt_thread(result)
         self._log(f"started thread {self.thread_id}")
 

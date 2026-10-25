@@ -62,6 +62,7 @@ async def main() -> int:
         instructions=lambda: build_developer_instructions(REPO, memory_dir_from_env()),
         mcp_servers=mcp_servers,
         log=lambda m: (logs.append(m), print(f"[bridge] {m}", flush=True)),
+        ephemeral=True,  # тред не попадает в историю /resume
     )
     done = asyncio.Event()
     methods: list[str] = []

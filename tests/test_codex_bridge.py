@@ -126,6 +126,22 @@ def test_handshake_and_thread_start_params(tmp_path):
     assert start["sandbox"] == "danger-full-access"
     assert start["developerInstructions"] == INSTR
     assert start["config"] == {"mcp_servers": MCP_SERVERS}
+    assert start["serviceName"] == "codex-gram"
+    assert "ephemeral" not in start
+
+
+def test_ephemeral_bridge_passes_flag_to_thread_start(tmp_path):
+    env = Env(tmp_path)
+    env.bridge.ephemeral = True
+
+    async def scenario():
+        assert await env.bridge.start(timeout=10) is True
+        await env.bridge.stop()
+
+    run(scenario())
+    start = env.requests("thread/start")[0]["params"]
+    assert start["ephemeral"] is True
+    assert start["serviceName"] == "codex-gram"
 
 
 def test_thread_start_persists_id(tmp_path):
