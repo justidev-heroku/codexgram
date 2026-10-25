@@ -556,13 +556,37 @@ _goal_check_task: asyncio.Task | None = None
 _goal_check_active: bool = False
 
 
+def _codex_images_root() -> str:
+    """Каталог сгенерированных Codex картинок (generated_images) под CODEX_HOME, realpath.
+
+    CODEX_GRAM_CODEX_HOME и CODEX_HOME уважаются, иначе ~/.codex. Сам .codex скрыт,
+    поэтому для картинок из этого каталога делается явное исключение в assert_sendable.
+    """
+    home = os.environ.get("CODEX_GRAM_CODEX_HOME") or os.environ.get("CODEX_HOME")
+    base = Path(home).expanduser() if home else Path.home() / ".codex"
+    return os.path.realpath(base / "generated_images")
+
+
 def assert_sendable(f: str) -> None:
     """Запрещает отправлять критические файлы сервера, скрытые папки и файлы вне разрешенных директорий."""
     try:
         real = os.path.realpath(f)
         state_real = os.path.realpath(STATE_DIR)
+        codex_images = _codex_images_root()
     except OSError:
         raise ValueError(f"Invalid path: {f}")
+
+    # Исключение: сгенерированные Codex картинки лежат в скрытом ~/.codex/generated_images.
+    # Проверка по realpath, поэтому симлинк наружу не проходит. Скрытые части внутри корня
+    # по-прежнему запрещены.
+    if real.startswith(codex_images + os.sep):
+        rel_images = real[len(codex_images) + 1:]
+        for part in Path(rel_images).parts:
+            if part.startswith(".") and part not in (".", ".."):
+                raise ValueError(f"Access denied to hidden path component: {f}")
+        if real.startswith(state_real + os.sep):
+            raise ValueError(f"refusing to send channel state: {f}")
+        return
 
     inbox = os.path.join(state_real, "inbox")
     allowed_roots = [
