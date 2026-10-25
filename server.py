@@ -78,7 +78,7 @@ import codex_accounts  # noqa: E402
 from codex_approvals import ApprovalBroker, request_text as approval_request_text  # noqa: E402
 from codex_bridge import BridgeError, CodexBridge, RPCError, child_env  # noqa: E402
 from codex_format import (  # noqa: E402
-    esc, extract_version, fmt_ago, is_newer, parse_device_login, render_usage,
+    esc, extract_version, is_newer, parse_device_login, render_usage,
     strip_ansi, truncate, usage_alert_text, window_label,
 )
 from codex_progress import ActionTracker, REPLY_TOOLS as REPLY_TOOL_NAMES  # noqa: E402
@@ -87,6 +87,7 @@ from codex_settings import (  # noqa: E402
     model_setting, update_settings,
 )
 from codex_turns import Throttle, TurnTracker, UsageAlerts  # noqa: E402
+from codex_threads import build_thread_label, is_own_thread  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths & env
@@ -2479,10 +2480,13 @@ async def cmd_resume(msg: Message) -> None:
         await msg.answer("⚠️ Codex ещё не готов, попробуй через минуту.")
         return
     try:
-        threads = await codex_bridge.list_threads(limit=10)
+        # Фильтр по владельцу делаем после запроса, поэтому берём запас и режем до 10 строк.
+        threads = await codex_bridge.list_threads(limit=50)
     except (BridgeError, RPCError) as e:
         await msg.answer(f"⚠️ Не получилось получить список тредов: {esc(e)}", parse_mode="HTML")
         return
+    owner = owner_chat()
+    threads = [t for t in threads if is_own_thread(t, owner)][:10]
     if not threads:
         await msg.answer("Сохранённых тредов нет. Напиши сообщение или /new.")
         return
@@ -2492,10 +2496,8 @@ async def cmd_resume(msg: Message) -> None:
         tid = str(t.get("id"))
         if not TREAD_ID_RE.match(tid):
             continue
-        label = truncate(t.get("name") or t.get("preview") or tid[:8], 40)
-        ago = fmt_ago(now - float(t.get("updatedAt") or now))
-        mark = "✓ " if tid == codex_bridge.thread_id else ""
-        rows.append([InlineKeyboardButton(text=f"{mark}{label} · {ago}", callback_data=f"res:{tid}")])
+        label = build_thread_label(t, now, current=tid == codex_bridge.thread_id)
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"res:{tid}")])
     await msg.answer("<b>Выбери тред для продолжения</b>", parse_mode="HTML",
                      reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
