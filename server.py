@@ -19,14 +19,26 @@ Python MCP SDK validates them away.
 import asyncio
 import datetime
 import glob
+import html as _html
 import os
 import re
 import shutil
+import signal
 import stat
 import sys
 import time
 from collections import deque
 from pathlib import Path
+
+# codex-gram: `--mcp` — это MCP-сервер, которого поднимает `codex app-server`.
+# Он никогда не поллит Telegram, даже если в окружении стоит CLAUDE_TELEGRAM_BACKGROUND=1
+# (второй поллер на том же токене дал бы 409 основному процессу).
+if "--mcp" in sys.argv[1:]:
+    os.environ["CLAUDE_TELEGRAM_BACKGROUND"] = "0"
+
+REPO_DIR = Path(__file__).resolve().parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
 
 try:  # pwd отсутствует на Windows
     import pwd
@@ -77,7 +89,7 @@ from aiogram.types import (
 # аккаунтам/токенам Claude Code — раньше они были захардкожены как /root.
 USER_HOME = Path(os.environ.get("CLAUDE_GRAM_HOME") or Path.home())
 
-STATE_DIR = Path(os.environ.get("TELEGRAM_STATE_DIR") or (Path.home() / ".claude" / "channels" / "telegram"))
+STATE_DIR = Path(os.environ.get("TELEGRAM_STATE_DIR") or (Path.home() / ".codex-gram" / "telegram"))
 ACCESS_FILE = STATE_DIR / "access.json"
 ENV_FILE = STATE_DIR / ".env"
 GOAL_FILE = STATE_DIR / "session_goal.txt"
@@ -313,6 +325,7 @@ auto_allow = False
 import sqlite3
 import threading
 
+STATE_DIR.mkdir(parents=True, exist_ok=True)  # MCP-дочерний процесс может стартовать раньше поллера
 DB_FILE = STATE_DIR / "history.db"
 _db = sqlite3.connect(DB_FILE, check_same_thread=False)
 _db_lock = threading.Lock()
@@ -1536,7 +1549,12 @@ async def stdin_loop(shutdown_evt: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    try:
+        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    except (ValueError, OSError) as e:  # stdin не пайп (например, /dev/null) — MCP-канала нет
+        log(f"mcp stdin is not a pipe ({e}); exiting")
+        shutdown_evt.set()
+        return
     while True:
         line = await reader.readline()
         if not line:  # EOF — клиент закрыл соединение
@@ -1562,7 +1580,82 @@ async def stdin_loop(shutdown_evt: asyncio.Event) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Доставка входящих сообщений Клоду
+# codex-gram: мост к `codex app-server` (поднимается только в фоновом процессе)
+# ---------------------------------------------------------------------------
+
+codex_bridge: "CodexBridge | None" = None
+CODEX_CHANNEL_ATTR_ORDER = ("chat_id", "message_id", "user", "user_id", "ts")
+_TAG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def build_codex_mcp_servers() -> dict:
+    """MCP-сервер telegram для codex: этот же server.py с --mcp (только инструменты).
+
+    Токен сюда не кладём: конфиг треда codex может попасть на диск в свои логи сессий.
+    MCP-процесс сам читает .env из TELEGRAM_STATE_DIR.
+    """
+    env = {
+        "CLAUDE_TELEGRAM_BACKGROUND": "0",
+        "TELEGRAM_STATE_DIR": str(STATE_DIR),
+        "CLAUDE_PLUGIN_ROOT": str(REPO_DIR),
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": str(Path.home()),
+    }
+    return {"telegram": {"command": sys.executable, "args": [str(REPO_DIR / "server.py"), "--mcp"], "env": env}}
+
+
+def build_codex_bridge() -> "CodexBridge":
+    from codex_bridge import CodexBridge
+
+    try:
+        instructions = (REPO_DIR / "codex_instructions.md").read_text("utf-8")
+    except OSError:
+        instructions = ""
+    codex_bin = os.environ.get("CODEX_GRAM_BIN") or shutil.which("codex") or "codex"
+    return CodexBridge(
+        state_dir=STATE_DIR,
+        cwd=os.environ.get("CODEX_GRAM_CWD") or str(USER_HOME),
+        instructions=instructions,
+        mcp_servers=build_codex_mcp_servers(),
+        cmd=[codex_bin, "app-server"],
+        log=log,
+    )
+
+
+def _escape_attr(value: str) -> str:
+    return _html.escape(value, quote=True).replace("\n", "&#10;").replace("\r", "&#13;").replace("\t", "&#9;")
+
+
+def format_channel_tag(content: str, meta: dict) -> str:
+    """Тег <channel> в формате Claude Channels: метаданные — атрибуты, текст — тело.
+
+    Значения атрибутов экранируются (кавычки, угловые скобки, переводы строк), так что
+    имя пользователя вида `a\"b>c` не ломает тег. В теле `<channel` и `</channel`
+    экранируются, чтобы текст сообщения не открыл и не закрыл тег раньше времени.
+    """
+    keys = [k for k in CODEX_CHANNEL_ATTR_ORDER if k in meta] + [k for k in meta if k not in CODEX_CHANNEL_ATTR_ORDER]
+    attrs = []
+    for key in keys:
+        value = meta.get(key)
+        if value is None or value == "" or not _TAG_NAME_RE.match(str(key)):
+            continue
+        attrs.append(f' {key}="{_escape_attr(str(value))}"')
+    body = re.sub(r"<(/?)channel", r"&lt;\1channel", content or "", flags=re.IGNORECASE)
+    return f'<channel source="telegram"{"".join(attrs)}>{body}</channel>'
+
+
+def _meta_paths(meta: dict, *keys: str) -> list:
+    out: list = []
+    for key in keys:
+        for part in (meta.get(key) or "").split(","):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return list(dict.fromkeys(out))
+
+
+# ---------------------------------------------------------------------------
+# Доставка входящих сообщений Codex
 # ---------------------------------------------------------------------------
 
 
@@ -1580,10 +1673,16 @@ async def deliver(content: str, meta: dict, thread_id=None) -> None:
     else:
         kind = "text"
     await log_message("in", meta.get("chat_id", ""), meta.get("message_id"), content, kind, paths, thread_id=thread_id)
+    if codex_bridge is None:
+        log("codex bridge is not running; inbound message not delivered")
+        return
+    text = format_channel_tag(content, meta)
+    images = [p for p in _meta_paths(meta, "image_paths", "image_path") if os.path.isfile(p)]
     try:
-        await notify("notifications/claude/channel", {"content": content, "meta": meta})
+        status = await codex_bridge.submit(text, images)
+        log(f"inbound -> codex: {status} (chat_id={meta.get('chat_id')})")
     except Exception as e:  # noqa: BLE001
-        log(f"failed to deliver inbound to Claude: {e}")
+        log(f"failed to deliver inbound to codex: {e}")
 
 
 
@@ -5249,11 +5348,13 @@ def cleanup_inbox() -> None:
 
 
 async def main() -> None:
-    global bot_username
+    global bot_username, codex_bridge
 
     harden_secret_permissions()
 
     if os.environ.get("CLAUDE_TELEGRAM_BACKGROUND") == "1":
+        codex_bridge = build_codex_bridge()
+        await codex_bridge.start(wait_ready=False)
         cleanup_inbox()
         try:
             me = await bot.get_me()
@@ -5389,7 +5490,17 @@ async def main() -> None:
                 except Exception:
                     pass
 
-    stdin_task = asyncio.create_task(stdin_loop(shutdown_evt))
+    stdin_task = None
+    if os.environ.get("CLAUDE_TELEGRAM_BACKGROUND") != "1":
+        # MCP-режим: stdin — канал JSON-RPC от codex app-server; его закрытие = выход.
+        stdin_task = asyncio.create_task(stdin_loop(shutdown_evt))
+    else:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, shutdown_evt.set)
+            except (NotImplementedError, RuntimeError):
+                pass
     
     polling_task = None
     topic_task = None
@@ -5446,7 +5557,7 @@ async def main() -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    tasks_to_cancel = [stdin_task]
+    tasks_to_cancel = [stdin_task] if stdin_task else []
     if polling_task:
         tasks_to_cancel.append(polling_task)
     if topic_task:
@@ -5463,6 +5574,9 @@ async def main() -> None:
     for t in tasks_to_cancel:
         t.cancel()
     await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+    if codex_bridge is not None:
+        await codex_bridge.stop()
 
     if os.environ.get("CLAUDE_TELEGRAM_BACKGROUND") == "1":
         try:
