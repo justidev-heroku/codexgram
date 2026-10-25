@@ -19,16 +19,34 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Sequence, Union
+from typing import Any, Awaitable, Callable, Iterable, Optional, Sequence, Union
+
+from codex_settings import AUTO_ON_REQUEST, approval_policy, effort_setting, load_settings, model_setting
 
 CLIENT_INFO = {"name": "codex-gram", "version": "0.1.0"}
 SANDBOX_MODE = "danger-full-access"
-APPROVAL_POLICY = "never"
+CODEX_HOME_ENV = "CODEX_GRAM_CODEX_HOME"
+APPROVAL_METHODS = frozenset({
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "execCommandApproval",
+    "applyPatchApproval",
+})
 # Один JSON-объект может быть очень большим (вывод команд, полные items) — дефолтный
 # лимит asyncio StreamReader (64 KiB) оборвал бы чтение, поэтому поднимаем его.
 STDOUT_LIMIT = 64 * 1024 * 1024
 DONE_TURNS_MAX = 1000
 STABLE_UPTIME_SEC = 60.0
+
+
+def child_env() -> dict:
+    """Окружение app-server. CODEX_GRAM_CODEX_HOME задаёт CODEX_HOME (аккаунт и тесты)."""
+    env = dict(os.environ)
+    home = os.environ.get(CODEX_HOME_ENV)
+    if home:
+        env["CODEX_HOME"] = home
+    return env
 
 
 class BridgeError(RuntimeError):
@@ -60,13 +78,14 @@ def build_input(text: str = "", images: Iterable[str] = ()) -> list[dict]:
     return items
 
 
-def _load_settings(state_dir: Path) -> dict:
-    """model/effort для следующих ходов. Пишется stage 2 (/model), здесь только чтение."""
-    try:
-        data = json.loads((state_dir / "codex_settings.json").read_text("utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+def approval_result(method: str, params: dict, allow: bool) -> dict:
+    """Ответ на server-запрос подтверждения. allow=False — отказ (без выдачи прав)."""
+    if method == "item/permissions/requestApproval":
+        granted = params.get("permissions") if allow and isinstance(params.get("permissions"), dict) else {}
+        return {"permissions": granted, "scope": "turn"}
+    if method in ("execCommandApproval", "applyPatchApproval"):
+        return {"decision": "approved" if allow else "denied"}
+    return {"decision": "accept" if allow else "decline"}
 
 
 class CodexBridge:
@@ -108,6 +127,7 @@ class CodexBridge:
         self._queue: list[list[dict]] = []
         self._done_turns: set[str] = set()
         self._listeners: list[Callable[[str, dict], Any]] = []
+        self._approval_handler: Optional[Callable[[str, dict], Awaitable[bool]]] = None
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -124,6 +144,13 @@ class CodexBridge:
     def add_listener(self, cb: Callable[[str, dict], Any]) -> None:
         """cb(method, params) вызывается для каждой нотификации app-server."""
         self._listeners.append(cb)
+
+    def set_approval_handler(self, handler: Optional[Callable[[str, dict], Awaitable[bool]]]) -> None:
+        """В режиме on-request спрашивает владельца: True — разрешить, False — отклонить."""
+        self._approval_handler = handler
+
+    def settings(self) -> dict:
+        return load_settings(self.state_dir)
 
     async def start(self, wait_ready: bool = True, timeout: float = 60.0) -> bool:
         """Запускает супервизор. Возвращает True, если первое подключение состоялось."""
@@ -177,6 +204,82 @@ class CodexBridge:
             ok = await self._start_turn_locked(merged)
             return "started" if ok else "queued"
 
+    async def restart_child(self, wait_timeout: float = 60.0) -> bool:
+        """Перезапускает дочерний app-server (например, после смены аккаунта).
+
+        Убиваем процесс, супервизор поднимает новый и возобновляет тред. Ход, который шёл,
+        теряется: его turn/completed уже не придёт, поэтому active_turn_id сбрасываем.
+        """
+        self.active_turn_id = None
+        self._ready.clear()
+        await self._kill_child()
+        if self._supervisor is None or self._supervisor.done():
+            await self.start(wait_ready=False)
+        try:
+            await asyncio.wait_for(self._ready.wait(), wait_timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def list_threads(self, limit: int = 10) -> list[dict]:
+        self._require_ready()
+        result = await self._request("thread/list", {
+            "archived": False, "limit": limit, "sortKey": "updated_at", "sortDirection": "desc",
+        })
+        return [t for t in result.get("data") or [] if isinstance(t, dict) and t.get("id")]
+
+    async def resume_thread(self, thread_id: str) -> str:
+        """Делает существующий тред активным. Нельзя, пока идёт ход."""
+        if not isinstance(thread_id, str) or not thread_id:
+            raise BridgeError("empty thread id")
+        async with self._turn_lock:
+            if self.active_turn_id is not None:
+                raise BridgeError("ход ещё идёт")
+            self._require_ready()
+            result = await self._request("thread/resume", {"threadId": thread_id, **self._thread_params()})
+            self._adopt_thread(result)
+            self._queue.clear()
+            return self.thread_id  # type: ignore[return-value]
+
+    async def archive_thread(self, thread_id: str) -> None:
+        self._require_ready()
+        await self._request("thread/archive", {"threadId": thread_id})
+
+    async def list_models(self) -> list[dict]:
+        self._require_ready()
+        result = await self._request("model/list", {"includeHidden": False, "limit": 100})
+        return [m for m in result.get("data") or [] if isinstance(m, dict) and m.get("model")]
+
+    async def rate_limits(self) -> dict:
+        self._require_ready()
+        return await self._request("account/rateLimits/read", {})
+
+    async def account(self) -> dict:
+        self._require_ready()
+        return await self._request("account/read", {})
+
+    async def goal_get(self) -> Optional[dict]:
+        self._require_ready()
+        if self.thread_id is None:
+            return None
+        result = await self._request("thread/goal/get", {"threadId": self.thread_id})
+        return result.get("goal")
+
+    async def goal_set(self, objective: str) -> dict:
+        self._require_ready()
+        result = await self._request("thread/goal/set", {
+            "threadId": self.thread_id, "objective": objective, "status": "active", "origin": "user",
+        })
+        return result.get("goal") or {}
+
+    async def goal_clear(self) -> None:
+        self._require_ready()
+        await self._request("thread/goal/clear", {"threadId": self.thread_id, "origin": "user"})
+
+    def _require_ready(self) -> None:
+        if not self._ready.is_set() or self.thread_id is None:
+            raise BridgeError("app-server не готов")
+
     async def interrupt(self) -> bool:
         """turn/interrupt для текущего хода. False, если хода нет."""
         turn_id = self.active_turn_id
@@ -205,7 +308,7 @@ class CodexBridge:
     def _thread_params(self) -> dict:
         params: dict = {
             "cwd": self.cwd,
-            "approvalPolicy": APPROVAL_POLICY,
+            "approvalPolicy": approval_policy(self.settings()),
             "sandbox": SANDBOX_MODE,
         }
         text = self.instructions() if callable(self.instructions) else self.instructions
@@ -266,12 +369,16 @@ class CodexBridge:
 
     async def _start_turn_locked(self, items: list[dict]) -> bool:
         """Вызывать под _turn_lock. При ошибке items возвращаются в начало очереди."""
-        settings = _load_settings(self.state_dir)
-        params: dict = {"threadId": self.thread_id, "input": items}
-        if settings.get("model"):
-            params["model"] = settings["model"]
-        if settings.get("effort"):
-            params["effort"] = settings["effort"]
+        settings = self.settings()
+        params: dict = {
+            "threadId": self.thread_id,
+            "input": items,
+            "approvalPolicy": approval_policy(settings),
+        }
+        if model_setting(settings):
+            params["model"] = model_setting(settings)
+        if effort_setting(settings):
+            params["effort"] = effort_setting(settings)
         try:
             result = await self._request("turn/start", params)
         except BridgeError as e:
@@ -359,6 +466,7 @@ class CodexBridge:
             stderr=None,
             cwd=self.cwd if os.path.isdir(self.cwd) else None,
             limit=STDOUT_LIMIT,
+            env=child_env(),
         )
         self._proc = proc
         self._reader_task = asyncio.create_task(self._read_loop(proc))
@@ -445,7 +553,12 @@ class CodexBridge:
         rid = msg.get("id")
         method = msg.get("method") or ""
         try:
-            result = self._server_request_result(method, msg.get("params") or {})
+            params = msg.get("params") or {}
+            if method in APPROVAL_METHODS and approval_policy(self.settings()) == AUTO_ON_REQUEST:
+                allow = await self._ask_owner(method, params)
+                result = approval_result(method, params, allow)
+            else:
+                result = self._server_request_result(method, params)
             if result is None:
                 reply = {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unsupported: {method}"}}
             else:
@@ -455,6 +568,16 @@ class CodexBridge:
         except BridgeError as e:
             self._log(f"could not answer server request {method}: {e}")
 
+    async def _ask_owner(self, method: str, params: dict) -> bool:
+        handler = self._approval_handler
+        if handler is None:
+            return False  # без обработчика на подтверждения отвечаем отказом
+        try:
+            return bool(await handler(method, params))
+        except Exception as e:  # noqa: BLE001
+            self._log(f"approval handler failed: {e}")
+            return False
+
     @staticmethod
     def _server_request_result(method: str, params: dict) -> Optional[dict]:
         if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
@@ -462,7 +585,7 @@ class CodexBridge:
         if method in ("execCommandApproval", "applyPatchApproval"):
             return {"decision": "approved"}
         if method == "item/permissions/requestApproval":
-            # Дополнительных прав не выдаём: при danger-full-access они и не нужны.
+            # В режиме never дополнительных прав не выдаём: danger-full-access их не требует.
             return {"permissions": {}, "scope": "turn"}
         if method == "item/tool/requestUserInput":
             return {"answers": {}}
