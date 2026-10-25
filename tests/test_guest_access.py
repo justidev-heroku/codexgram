@@ -237,40 +237,44 @@ def test_owner_share_command_works(state):
     assert GUEST in read_access(state)["allowFrom"]
 
 
-@pytest.mark.parametrize("handler", ["on_model_callback", "on_model_add", "on_restart_confirm",
-                                     "on_effort_callback", "on_delete_button", "on_goal_clear",
-                                     "on_restart_cancel", "on_close_button"])
-def test_guest_denied_callbacks(state, handler, monkeypatch):
+@pytest.mark.parametrize("handler,data", [
+    ("on_model_pick", "model:gpt-x"),
+    ("on_effort_pick", "effort:high"),
+    ("on_resume_pick", "res:abc123"),
+    ("on_goal_clear_button", "goal_clear"),
+    ("on_approval_button", "apr:a:abcdef12"),
+    ("on_turn_retry", "turn:retry"),
+    ("on_login_cancel", "login:cancel"),
+    ("on_switch_pick", "acc:work"),
+    ("on_delete_account_pick", "accdel:work"),
+    ("on_update_go", "upd:go"),
+])
+def test_guest_denied_callbacks(state, handler, data, monkeypatch):
     write_access(state, {"allowFrom": [OWNER, GUEST]})
-    restart = MagicMock()
-    monkeypatch.setattr(server, "safe_restart", restart)
+    update = MagicMock()
+    monkeypatch.setattr(server, "update_settings", update)
     cb = MagicMock()
     cb.from_user = user(GUEST)
-    cb.data = "model:sonnet"
+    cb.data = data
     cb.answer = AsyncMock()
     asyncio.run(getattr(server, handler)(cb))
     cb.answer.assert_awaited_once_with("Нет доступа.")
-    restart.assert_not_called()
+    update.assert_not_called()
 
 
-def test_guest_denied_permission_callback(state):
+def test_guest_cannot_resolve_owner_approval(state):
     write_access(state, {"allowFrom": [OWNER, GUEST]})
-    handler = server.on_permission_button
     cb = MagicMock()
     cb.from_user = user(GUEST)
-    cb.data = "perm:allow:abcde"
+    cb.data = "apr:a:abcdef12"
     cb.answer = AsyncMock()
-    notify = AsyncMock()
-    server_notify = server.notify
-    server.notify = notify
+    resolve = MagicMock(return_value=True)
+    server.approval_broker.resolve = resolve
     try:
-        asyncio.run(handler(cb))
+        asyncio.run(server.on_approval_button(cb))
     finally:
-        server.notify = server_notify
-    cb.answer.assert_awaited_once_with("Нет доступа.")
-    notify.assert_not_awaited()
-
-
+        del server.approval_broker.resolve
+    resolve.assert_not_called()
 # --------------------------------------------------------------------------- inbound
 
 

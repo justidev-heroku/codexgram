@@ -1,3 +1,6 @@
+import pytest  # noqa: E402
+
+pytestmark = pytest.mark.skip(reason="stage 3: guest runtime (instances, inbox.sock, managed bots) removed from codex-gram stage 2")
 """Гостевой режим: отдельный экземпляр на гостя.
 
 Мастер (владелец) пересылает апдейты гостя в unix-сокет его экземпляра; гостевой

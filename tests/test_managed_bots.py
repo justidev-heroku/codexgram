@@ -1,3 +1,6 @@
+import pytest  # noqa: E402
+
+pytestmark = pytest.mark.skip(reason="stage 3: guest runtime (instances, inbox.sock, managed bots) removed from codex-gram stage 2")
 """Свой бот гостя через Telegram Managed Bots: bot.env, мастер-мидлварь, роутер, /mybot."""
 import asyncio
 import json
