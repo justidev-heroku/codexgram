@@ -1,5 +1,14 @@
 # DEVLOG
 
+## 2026-10-25 — codex-gram: /resume — подписи, свои треды, эфемерный смоук
+
+- Проблема (скрин владельца): кнопки /resume показывали сырой `<channel source="telegram" chat_id="873…` (Codex берёт в качестве превью первое сообщение, а наше начинается с тега), время обрезалось в конце подписи, в списке были тестовые треды `chat_id="111"`.
+- `codex_threads.py` (новый): `clean_preview` убирает `<channel ...>` и `</channel>` (в том числе оборванные в превью), снимает HTML-сущности и схлопывает пробелы; пустой текст → «(медиа/без текста)». `build_thread_label`: «🕐 <давность> · <текст>», время первым, общая длина до 48 символов с «…»; если у треда есть `name`, берётся он.
+- Отбор своих тредов. `Thread` в `thread/list` не содержит поля serviceName (ни `ThreadListParams`, ни `Thread` его не поддерживают; фильтра по сервису нет). Поэтому: мост передаёт `serviceName: "codex-gram"` в `thread/start` (поле есть в `ThreadStartParams`), а `/resume` оставляет треды, у которых в превью первый `<channel>` несёт `chat_id` владельца из access.json (`is_own_thread`). Тред без тега, с чужим или тестовым `chat_id` (111) не показывается. Список запрашивается на 50 строк, фильтр применяется, затем режется до 10. Текущий тред 01a17094 проходит по chat_id-правилу.
+- `CodexBridge(ephemeral=...)`: в `thread/start` уходит `ephemeral: true`. `scripts/smoke_bridge.py` работает с эфемерным тредом, в историю не попадает.
+- `scripts/archive_test_threads.py` (одноразовый): поднимает свежий `codex app-server` через мост (эфемерный тред), листает `thread/list` с курсором и архивирует треды с `chat_id="111"`. По умолчанию `--dry-run`, архивирует только с `--apply`. Прогнан только в dry-run.
+- Тесты: `tests/test_codex_threads.py` (подписи, очистка, отбор, смоук), `tests/test_codex_bridge.py` (serviceName и ephemeral в thread/start).
+
 ## 2026-10-25 — codex-gram: картинки Codex, правила отправки, регламент согласования
 
 - `server.py` `assert_sendable`: исключение для `CODEX_HOME/generated_images` (по умолчанию `~/.codex/generated_images`, уважаются `CODEX_GRAM_CODEX_HOME` и `CODEX_HOME`). Проверка по realpath, так что симлинк наружу не проходит. Скрытые компоненты внутри корня запрещены. `auth.json`, `config.toml`, сессии и `~/.ssh` остаются закрыты. Раньше картинки падали с «Access denied to hidden path component».
