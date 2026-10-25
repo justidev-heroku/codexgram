@@ -27,7 +27,7 @@ sys.path.insert(0, str(REPO))
 from codex_bridge import CodexBridge  # noqa: E402
 
 FAKE_MCP = REPO / "tests" / "fixtures" / "fake_mcp.py"
-INSTRUCTIONS = (REPO / "codex_instructions.md").read_text("utf-8")
+from codex_instructions import build_developer_instructions, memory_dir_from_env  # noqa: E402
 PROMPT = (
     '<channel source="telegram" chat_id="111" message_id="5" user="smoke" user_id="1" ts="2026-10-25T00:00:00+00:00">'
     "Smoke test: ответь одним словом pong через инструмент reply (chat_id=111)."
@@ -59,7 +59,7 @@ async def main() -> int:
     bridge = CodexBridge(
         state_dir=state,
         cwd=str(work),
-        instructions=INSTRUCTIONS,
+        instructions=lambda: build_developer_instructions(REPO, memory_dir_from_env()),
         mcp_servers=mcp_servers,
         log=lambda m: (logs.append(m), print(f"[bridge] {m}", flush=True)),
     )
