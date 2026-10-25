@@ -20,6 +20,9 @@
   `~/.codex-gram/telegram`.
 - `codex_instructions.md` — developerInstructions для треда: ответ пользователю
   только через `reply`, `chat_id` из тега, format=html, язык пользователя.
+- Инструкции треда собирает `codex_instructions.py`: правила моста + `codex_workflow.md`
+  (регламент владельца, адаптированный под Codex) + индекс памяти `MEMORY.md` (до 60 КБ).
+  Собирается при каждом `thread/start`, каталог памяти — `CODEX_GRAM_MEMORY_DIR`.
 - Токен бота в MCP-конфиг треда не кладётся: конфиг может осесть в логах сессий codex.
 - Тесты: `tests/test_codex_bridge.py` (фейковый app-server), `tests/test_codex_gram_wiring.py`.
   `scripts/smoke_bridge.py` — прогон через настоящий `codex app-server` с MCP-стабом.
