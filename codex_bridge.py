@@ -19,7 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
 CLIENT_INFO = {"name": "codex-gram", "version": "0.1.0"}
 SANDBOX_MODE = "danger-full-access"
@@ -75,7 +75,7 @@ class CodexBridge:
         *,
         state_dir: Path,
         cwd: str,
-        instructions: str = "",
+        instructions: Union[str, Callable[[], str]] = "",
         mcp_servers: Optional[dict] = None,
         cmd: Optional[Sequence[str]] = None,
         log: Optional[Callable[[str], None]] = None,
@@ -208,8 +208,9 @@ class CodexBridge:
             "approvalPolicy": APPROVAL_POLICY,
             "sandbox": SANDBOX_MODE,
         }
-        if self.instructions:
-            params["developerInstructions"] = self.instructions
+        text = self.instructions() if callable(self.instructions) else self.instructions
+        if text:
+            params["developerInstructions"] = text
         if self.mcp_servers:
             params["config"] = {"mcp_servers": self.mcp_servers}
         return params

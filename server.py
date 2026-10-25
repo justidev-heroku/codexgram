@@ -1606,16 +1606,15 @@ def build_codex_mcp_servers() -> dict:
 
 def build_codex_bridge() -> "CodexBridge":
     from codex_bridge import CodexBridge
+    from codex_instructions import build_developer_instructions, memory_dir_from_env
 
-    try:
-        instructions = (REPO_DIR / "codex_instructions.md").read_text("utf-8")
-    except OSError:
-        instructions = ""
+    memory_dir = memory_dir_from_env()
     codex_bin = os.environ.get("CODEX_GRAM_BIN") or shutil.which("codex") or "codex"
     return CodexBridge(
         state_dir=STATE_DIR,
         cwd=os.environ.get("CODEX_GRAM_CWD") or str(USER_HOME),
-        instructions=instructions,
+        # Перечитывается при каждом thread/start (см. CodexBridge._thread_params).
+        instructions=lambda: build_developer_instructions(REPO_DIR, memory_dir),
         mcp_servers=build_codex_mcp_servers(),
         cmd=[codex_bin, "app-server"],
         log=log,
