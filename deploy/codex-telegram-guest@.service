@@ -1,0 +1,31 @@
+# Экземпляр codex-gram для гостя %i (Telegram id). Шаблон: включает и выключает мастер
+# (codex-telegram.service) на /share, /unshare и при старте. Вручную:
+#   systemctl enable --now codex-telegram-guest@<uid>.service
+[Unit]
+Description=codex-gram guest instance %i
+After=network-online.target codex-telegram.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/codex-gram
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CLAUDE_TELEGRAM_BACKGROUND=1
+Environment=CODEX_GRAM_GUEST_UID=%i
+# STATE_DIR гостя обязан быть <STATE_DIR мастера>/guests/<uid>: токен общего бота берётся
+# из .env мастера, inbox.sock и bot.env кладёт мастер.
+Environment=TELEGRAM_STATE_DIR=/root/.codex-gram/telegram/guests/%i
+Environment=CODEX_GRAM_CWD=/root/guests-codex/%i
+# Токен бота и CODEX_HOME здесь не задаются: токен — bot.env гостя или .env мастера,
+# CODEX_HOME — ~/.codex (общий аккаунт) или guests/%i/codex после /login гостя.
+ExecStart=/usr/bin/python3 /root/codex-gram/server.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+# codex app-server — дочерний процесс: при остановке экземпляра умирает вся группа.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
