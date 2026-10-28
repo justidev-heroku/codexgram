@@ -128,6 +128,7 @@ def main():
         _log({"kind": "request", "method": meth, "params": params, "id": mid})
 
         if meth == "initialize":
+            _log({"kind": "env", "CODEX_HOME": os.environ.get("CODEX_HOME")})
             reply(mid, {"userAgent": "fake-codex/0", "codexHome": "/nonexistent", "platformOs": "linux"})
         elif meth == "initialized":
             pass
@@ -167,6 +168,14 @@ def main():
                 reply(mid, {"turnId": Turn.current})
         elif meth == "turn/interrupt":
             reply(mid, {})
+        elif meth == "thread/list":
+            reply(mid, {"data": [{"id": t, "preview": "", "cwd": params.get("cwd") or "/"} for t in st["threads"]]})
+        elif meth == "thread/read":
+            tid = params.get("threadId")
+            if tid in st["threads"]:
+                reply(mid, {"thread": {"id": tid, "preview": "", "cwd": "/"}})
+            else:
+                reply(mid, error={"code": -32600, "message": f"no such thread {tid}"})
         else:
             if mid is not None:
                 reply(mid, error={"code": -32601, "message": f"unknown method {meth}"})

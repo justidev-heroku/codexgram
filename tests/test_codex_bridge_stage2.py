@@ -185,3 +185,75 @@ def test_methods_refuse_when_not_ready(tmp_path):
             await env.bridge.goal_get()
 
     run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Этап 3: окружение дочернего процесса, вычисляемые mcp_servers, thread/list cwd, thread/read
+# ---------------------------------------------------------------------------
+
+
+def test_env_factory_is_called_on_every_spawn(tmp_path):
+    env = Env(tmp_path)
+    homes = iter([str(tmp_path / "home-a"), str(tmp_path / "home-b")])
+    env.bridge.env_factory = lambda: {**__import__("os").environ, "CODEX_HOME": next(homes)}
+
+    async def scenario():
+        await env.bridge.start(timeout=10)
+        await env.bridge.restart_child()
+        await env.bridge.stop()
+
+    run(scenario())
+    seen = [r["CODEX_HOME"] for r in env.records() if r.get("kind") == "env"]
+    assert seen == [str(tmp_path / "home-a"), str(tmp_path / "home-b")]
+
+
+def test_callable_mcp_servers_are_evaluated_per_thread_request(tmp_path):
+    env = Env(tmp_path)
+    calls = []
+
+    def servers():
+        calls.append(1)
+        return {"telegram": {"command": "x", "args": [], "env": {"N": str(len(calls))}}}
+
+    env.bridge.mcp_servers = servers
+
+    async def scenario():
+        await env.bridge.start(timeout=10)
+        await env.bridge.new_thread()
+        await env.bridge.stop()
+
+    run(scenario())
+    starts = env.requests("thread/start")
+    assert [s["params"]["config"]["mcp_servers"]["telegram"]["env"]["N"] for s in starts] == ["1", "2"]
+
+
+def test_list_threads_passes_cwd_filter_only_when_given(tmp_path):
+    env = Env(tmp_path)
+
+    async def scenario():
+        await env.bridge.start(timeout=10)
+        await env.bridge.list_threads(limit=5)
+        await env.bridge.list_threads(limit=5, cwd="/root/guests-codex/1")
+        await env.bridge.stop()
+
+    run(scenario())
+    lists = [r["params"] for r in env.requests("thread/list")]
+    assert "cwd" not in lists[0]
+    assert lists[1]["cwd"] == "/root/guests-codex/1"
+
+
+def test_read_thread_returns_metadata_and_raises_on_unknown(tmp_path):
+    env = Env(tmp_path)
+
+    async def scenario():
+        await env.bridge.start(timeout=10)
+        meta = await env.bridge.read_thread(env.bridge.thread_id)
+        with pytest.raises(BridgeError):
+            await env.bridge.read_thread("nope")
+        await env.bridge.stop()
+        return meta
+
+    meta = run(scenario())
+    assert meta["id"].startswith("thr-")
+    req = env.requests("thread/read")[0]["params"]
+    assert req["includeTurns"] is False

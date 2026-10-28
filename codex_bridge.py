@@ -97,12 +97,13 @@ class CodexBridge:
         state_dir: Path,
         cwd: str,
         instructions: Union[str, Callable[[], str]] = "",
-        mcp_servers: Optional[dict] = None,
+        mcp_servers: Union[None, dict, Callable[[], Optional[dict]]] = None,
         cmd: Optional[Sequence[str]] = None,
         log: Optional[Callable[[str], None]] = None,
         restart_backoff: tuple[float, float] = (1.0, 30.0),
         request_timeout: float = 60.0,
         ephemeral: bool = False,
+        env: Optional[Callable[[], dict]] = None,
     ):
         self.state_dir = Path(state_dir)
         self.cwd = cwd
@@ -113,6 +114,9 @@ class CodexBridge:
         self._backoff_min, self._backoff_max = restart_backoff
         self._request_timeout = request_timeout
         self.ephemeral = ephemeral
+        # Окружение дочернего app-server; вызывается при каждом запуске (смена аккаунта гостя
+        # меняет CODEX_HOME без пересоздания моста).
+        self.env_factory = env or child_env
 
         self.session_file = self.state_dir / "active_session_id"
         self.thread_id: Optional[str] = None
@@ -225,12 +229,21 @@ class CodexBridge:
         except asyncio.TimeoutError:
             return False
 
-    async def list_threads(self, limit: int = 10) -> list[dict]:
+    async def list_threads(self, limit: int = 10, cwd: Optional[str] = None) -> list[dict]:
+        """thread/list. cwd — фильтр на стороне сервера (точное совпадение cwd сессии)."""
         self._require_ready()
-        result = await self._request("thread/list", {
-            "archived": False, "limit": limit, "sortKey": "updated_at", "sortDirection": "desc",
-        })
+        params: dict = {"archived": False, "limit": limit, "sortKey": "updated_at", "sortDirection": "desc"}
+        if cwd:
+            params["cwd"] = cwd
+        result = await self._request("thread/list", params)
         return [t for t in result.get("data") or [] if isinstance(t, dict) and t.get("id")]
+
+    async def read_thread(self, thread_id: str) -> dict:
+        """thread/read без истории ходов: метаданные треда (preview, cwd, ...)."""
+        self._require_ready()
+        result = await self._request("thread/read", {"threadId": thread_id, "includeTurns": False})
+        thread = result.get("thread")
+        return thread if isinstance(thread, dict) else {}
 
     async def resume_thread(self, thread_id: str) -> str:
         """Делает существующий тред активным. Нельзя, пока идёт ход."""
@@ -318,8 +331,9 @@ class CodexBridge:
         text = self.instructions() if callable(self.instructions) else self.instructions
         if text:
             params["developerInstructions"] = text
-        if self.mcp_servers:
-            params["config"] = {"mcp_servers": self.mcp_servers}
+        servers = self.mcp_servers() if callable(self.mcp_servers) else self.mcp_servers
+        if servers:
+            params["config"] = {"mcp_servers": servers}
         return params
 
     def _start_params(self) -> dict:
@@ -477,7 +491,7 @@ class CodexBridge:
             stderr=None,
             cwd=self.cwd if os.path.isdir(self.cwd) else None,
             limit=STDOUT_LIMIT,
-            env=child_env(),
+            env=self.env_factory(),
         )
         self._proc = proc
         self._reader_task = asyncio.create_task(self._read_loop(proc))
