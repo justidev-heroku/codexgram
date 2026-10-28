@@ -1,6 +1,3 @@
-import pytest  # noqa: E402
-
-pytestmark = pytest.mark.skip(reason="stage 3: guest runtime (instances, inbox.sock, managed bots) removed from codex-gram stage 2")
 """Свой бот гостя через Telegram Managed Bots: bot.env, мастер-мидлварь, роутер, /mybot."""
 import asyncio
 import json
@@ -28,7 +25,7 @@ BOT_TOKEN = "7777001:SECRET_TOKEN_value_xyz"
 def state(tmp_path, monkeypatch):
     owner_state = tmp_path / "owner"
     home = tmp_path / "home"
-    (home / ".claude").mkdir(parents=True)
+    home.mkdir()
     owner_state.mkdir()
     monkeypatch.setattr(server, "STATE_DIR", owner_state)
     monkeypatch.setattr(server, "ACCESS_FILE", owner_state / "access.json")
@@ -36,10 +33,9 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_known_users_cache", None)
     monkeypatch.setattr(server, "GUESTS_STATE_ROOT", owner_state / "guests")
     monkeypatch.setattr(server, "USER_HOME", home)
-    monkeypatch.setattr(server, "OWNER_SETTINGS_FILE", home / ".claude" / "settings.json")
     monkeypatch.setattr(server, "session_thread_id", None)
     monkeypatch.setattr(server, "_guest_bot_hint_at", {})
-    monkeypatch.delenv("CLAUDE_GRAM_GUESTS_DIR", raising=False)
+    monkeypatch.delenv("CODEX_GRAM_GUESTS_DIR", raising=False)
     (owner_state / "access.json").write_text(json.dumps(
         {"owner": OWNER, "allowFrom": [OWNER, GUEST]}), "utf-8")
     return owner_state
@@ -67,8 +63,8 @@ def _user(uid, username=None, first="Guest"):
     return u
 
 
-def managed_update(creator=GUEST, bot_id=BOT_ID, username="guest_claude_bot"):
-    bot_info = {"id": bot_id, "is_bot": True, "first_name": "Claude"}
+def managed_update(creator=GUEST, bot_id=BOT_ID, username="guest_codex_bot"):
+    bot_info = {"id": bot_id, "is_bot": True, "first_name": "Codex"}
     if username is not None:
         bot_info["username"] = username
     return Update.model_validate({
@@ -100,15 +96,60 @@ def reaction_update(uid):
 
 
 def test_save_load_remove_bot_env(state):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "@guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "@guest_codex_bot")
     path = server.guest_bot_env_path(GUEST)
     assert path == server.guest_state_dir(GUEST) / "bot.env"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert not path.with_name("bot.env.tmp").exists()
     assert path.read_text("utf-8") == (
-        f"TELEGRAM_BOT_TOKEN={BOT_TOKEN}\nBOT_ID={BOT_ID}\nBOT_USERNAME=guest_claude_bot\n")
+        f"TELEGRAM_BOT_TOKEN={BOT_TOKEN}\nBOT_ID={BOT_ID}\nBOT_USERNAME=guest_codex_bot\n")
     assert server.load_guest_bot(GUEST) == {
-        "token": BOT_TOKEN, "bot_id": str(BOT_ID), "username": "guest_claude_bot"}
+        "token": BOT_TOKEN, "bot_id": str(BOT_ID), "username": "guest_codex_bot"}
+
+    server.remove_guest_bot(GUEST)
+    assert not path.exists()
+    server.remove_guest_bot(GUEST)  # повторно не падает
+
+
+def test_load_missing_or_broken_returns_none(state):
+    assert server.load_guest_bot(GUEST) is None
+    path = server.guest_bot_env_path(GUEST)
+    path.parent.mkdir(parents=True)
+    path.write_text("BOT_ID=7\nBOT_USERNAME=x\n", "utf-8")
+    assert server.load_guest_bot(GUEST) is None
+    path.write_text("TELEGRAM_BOT_TOKEN=\n", "utf-8")
+    assert server.load_guest_bot(GUEST) is None
+    path.write_bytes(b"\xff\xfe\x00garbage")
+    assert server.load_guest_bot(GUEST) is None
+
+
+def test_save_rejects_empty_or_multiline_token(state):
+    for bad in ("", "   ", "a\nb", "a b", "a\rb"):
+        with pytest.raises(ValueError):
+            server.save_guest_bot(GUEST, bad, BOT_ID, "x")
+    assert not server.guest_bot_env_path(GUEST).exists()
+
+
+def test_save_username_none_is_empty(state):
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, None)
+    assert server.load_guest_bot(GUEST)["username"] == ""
+
+
+def test_bot_env_path_rejects_bad_uid(state):
+    with pytest.raises(ValueError):
+        server.guest_bot_env_path("../owner")
+
+
+def test_save_load_remove_bot_env(state):
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "@guest_codex_bot")
+    path = server.guest_bot_env_path(GUEST)
+    assert path == server.guest_state_dir(GUEST) / "bot.env"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not path.with_name("bot.env.tmp").exists()
+    assert path.read_text("utf-8") == (
+        f"TELEGRAM_BOT_TOKEN={BOT_TOKEN}\nBOT_ID={BOT_ID}\nBOT_USERNAME=guest_codex_bot\n")
+    assert server.load_guest_bot(GUEST) == {
+        "token": BOT_TOKEN, "bot_id": str(BOT_ID), "username": "guest_codex_bot"}
 
     server.remove_guest_bot(GUEST)
     assert not path.exists()
@@ -230,13 +271,13 @@ def test_mw_guest_creator_saves_token_restarts_instance(state, fake_bot, monkeyp
     handler.assert_not_called()
     get_tok.assert_awaited_once_with(BOT_ID)
     saved = server.load_guest_bot(GUEST)
-    assert saved["token"] == BOT_TOKEN and saved["username"] == "guest_claude_bot"
+    assert saved["token"] == BOT_TOKEN and saved["username"] == "guest_codex_bot"
     assert stat.S_IMODE(server.guest_bot_env_path(GUEST).stat().st_mode) == 0o600
     # сообщение гостю через общий бот
     fake_bot.send_message.assert_awaited()
     args, kwargs = fake_bot.send_message.await_args
     assert args[0] == int(GUEST)
-    assert "t.me/guest_claude_bot" in args[1]
+    assert "t.me/guest_codex_bot" in args[1]
     assert kwargs.get("parse_mode") == "HTML"
     # экземпляр гостя перезапущен, состояние подготовлено
     _no_real_systemctl.assert_awaited_with("restart", "--no-block", server.GUEST_UNIT.format(uid=GUEST))
@@ -331,16 +372,8 @@ def test_managed_bot_parsed_from_real_json_as_extra(state):
 
 
 def test_token_never_logged(state, fake_bot, monkeypatch, capsys, tmp_path):
-    # Настоящий логгер (без подмены), проверяем и stderr, и файл /tmp/bot_debug.log.
-    debug_file = tmp_path / "bot_debug.log"
-    real_open = open
-
-    def fake_open(path, *a, **kw):
-        if str(path) == "/tmp/bot_debug.log":
-            return real_open(debug_file, *a, **kw)
-        return real_open(path, *a, **kw)
-
-    monkeypatch.setattr("builtins.open", fake_open)
+    # Настоящий логгер (без подмены): stderr и STATE_DIR/bot.log.
+    debug_file = state / "bot.log"
     monkeypatch.setattr(server, "get_managed_bot_token", AsyncMock(return_value=BOT_TOKEN))
     _run_mw(managed_update())
     _run_mw(managed_update(creator=OWNER))
@@ -383,18 +416,18 @@ def test_router_plain_guest_is_forwarded(state, fake_bot, forward):
 
 
 def test_router_own_bot_guest_redirected_not_forwarded(state, fake_bot, forward):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_codex_bot")
     result, handler = _run_router(msg_update(GUEST, "hello"))
     forward.assert_not_awaited()
     handler.assert_not_called()
     assert result is None
     fake_bot.send_message.assert_awaited_once()
     args = fake_bot.send_message.await_args.args
-    assert args[0] == int(GUEST) and "@guest_claude_bot" in args[1]
+    assert args[0] == int(GUEST) and "@guest_codex_bot" in args[1]
 
 
 def test_router_own_bot_hint_throttled_60s(state, fake_bot, forward):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_codex_bot")
     for i in range(5):
         _run_router(msg_update(GUEST, f"m{i}", update_id=i + 1))
     assert fake_bot.send_message.await_count == 1
@@ -406,7 +439,7 @@ def test_router_own_bot_hint_throttled_60s(state, fake_bot, forward):
 
 
 def test_router_own_bot_other_updates_silently_ignored(state, fake_bot, forward):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_codex_bot")
     result, handler = _run_router(reaction_update(GUEST))
     assert result is None
     forward.assert_not_awaited()
@@ -417,7 +450,7 @@ CREATED = {"managed_bot_created": {"bot": {"id": BOT_ID, "is_bot": True, "first_
 
 
 def test_router_own_bot_mybot_answered_by_master_not_forwarded(state, fake_bot, forward):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_codex_bot")
     result, handler = _run_router(msg_update(GUEST, "/mybot"))
     forward.assert_not_awaited()
     handler.assert_not_called()
@@ -425,7 +458,7 @@ def test_router_own_bot_mybot_answered_by_master_not_forwarded(state, fake_bot, 
     fake_bot.send_message.assert_awaited_once()
     args, kwargs = fake_bot.send_message.await_args
     assert args[0] == int(GUEST)
-    assert "@guest_claude_bot" in args[1]
+    assert "@guest_codex_bot" in args[1]
     assert kwargs["reply_markup"].keyboard[0][0].request_managed_bot is not None
     real_bot = Bot(server.TOKEN)  # server.bot подменён моком, сериализуем настоящим Bot
     wire = json.loads(real_bot.session.prepare_value(kwargs["reply_markup"], bot=real_bot, files={}))
@@ -433,14 +466,14 @@ def test_router_own_bot_mybot_answered_by_master_not_forwarded(state, fake_bot, 
 
 
 def test_router_own_bot_mybot_with_bot_suffix_not_forwarded(state, fake_bot, forward):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_codex_bot")
     _run_router(msg_update(GUEST, "/mybot@SomeBot"))
     forward.assert_not_awaited()
     fake_bot.send_message.assert_awaited_once()
 
 
 def test_router_own_bot_managed_bot_created_never_forwarded(state, fake_bot, forward):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_codex_bot")
     result, handler = _run_router(msg_update(GUEST, None, extra=CREATED))
     assert result is None
     forward.assert_not_awaited()
@@ -463,7 +496,7 @@ def test_router_no_bot_env_mybot_still_forwarded(state, fake_bot, forward):
 
 
 def test_recreate_offer_failure_is_logged(state, fake_bot, forward, logs):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_codex_bot")
     fake_bot.send_message.side_effect = RuntimeError("blocked")
     _run_router(msg_update(GUEST, "/mybot"))
     forward.assert_not_awaited()
@@ -510,7 +543,7 @@ def test_keyboard_serializes_request_managed_bot():
     kb = server.managed_bot_keyboard("Ann")
     dumped = kb.model_dump(exclude_none=True)
     btn = dumped["keyboard"][0][0]
-    assert btn["request_managed_bot"] == {"request_id": 1, "suggested_name": "Claude Ann"}
+    assert btn["request_managed_bot"] == {"request_id": 1, "suggested_name": "Codex Ann"}
     assert dumped["resize_keyboard"] is True and dumped["one_time_keyboard"] is True
     # то же, что уходит в запрос к Bot API
     prepared = server.bot.session.prepare_value(kb, bot=server.bot, files={})
@@ -521,9 +554,9 @@ def test_keyboard_serializes_request_managed_bot():
 def test_keyboard_suggested_name_is_capped_and_handles_none():
     kb = server.managed_bot_keyboard("Я" * 200)
     name = kb.model_dump(exclude_none=True)["keyboard"][0][0]["request_managed_bot"]["suggested_name"]
-    assert len(name) == 64 and name.startswith("Claude ")
+    assert len(name) == 64 and name.startswith("Codex ")
     kb2 = server.managed_bot_keyboard(None)
-    assert kb2.model_dump(exclude_none=True)["keyboard"][0][0]["request_managed_bot"]["suggested_name"] == "Claude"
+    assert kb2.model_dump(exclude_none=True)["keyboard"][0][0]["request_managed_bot"]["suggested_name"] == "Codex"
 
 
 def test_mybot_in_guest_menu():
@@ -568,7 +601,7 @@ def test_allowed_updates_contain_managed_bot():
 
 
 def test_unshare_removes_guest_bot(state, monkeypatch, fake_bot, _no_real_systemctl):
-    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_claude_bot")
+    server.save_guest_bot(GUEST, BOT_TOKEN, BOT_ID, "guest_codex_bot")
     answer = AsyncMock()
     monkeypatch.setattr(Message, "answer", answer)
     monkeypatch.setattr(server, "clear_guest_commands", AsyncMock())
