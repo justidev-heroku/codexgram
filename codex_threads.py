@@ -46,15 +46,21 @@ def preview_chat_id(preview: Optional[str]) -> Optional[str]:
     return attr.group(1) if attr else None
 
 
-def is_own_thread(thread: dict, owner_chat_id: Optional[str]) -> bool:
+def is_own_thread(thread: dict, owner_chat_id: Optional[str], cwd: Optional[str] = None) -> bool:
     """Тред принадлежит этому боту и владельцу.
 
     В Thread (ThreadListResponse) нет поля serviceName, поэтому признак «наш» берём из превью:
     первое сообщение треда несёт chat_id владельца. Тред с другим chat_id (в т.ч. тестовый
     chat_id="111" от смоук-прогонов) и тред без тега (чужой или пустой) не показываем.
     Если владелец не известен, не показываем ничего.
+
+    cwd (гостевой экземпляр): тред должен ещё и лежать в рабочем каталоге гостя. В общем
+    CODEX_HOME треды владельца и гостей хранятся вместе, двойная проверка не даёт гостю
+    увидеть чужой тред, даже если кто-то подставит его chat_id в превью.
     """
     if not owner_chat_id:
+        return False
+    if cwd is not None and str(thread.get("cwd") or "") != str(cwd):
         return False
     return preview_chat_id(thread.get("preview")) == str(owner_chat_id)
 

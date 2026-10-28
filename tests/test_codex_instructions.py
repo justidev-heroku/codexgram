@@ -158,3 +158,49 @@ def test_memory_dir_env_override(monkeypatch, tmp_path):
     assert memory_dir_from_env() == tmp_path / "m"
     monkeypatch.delenv("CODEX_GRAM_MEMORY_DIR")
     assert str(memory_dir_from_env()) == DEFAULT_MEMORY_DIR
+
+
+# ---------------------------------------------------------------------------
+# Гостевой тред (этап 3): без регламента и памяти владельца
+# ---------------------------------------------------------------------------
+
+SECRET_MEMORY_LINE = "- [Секрет](secret.md) — токен 7777:SECRET_in_memory"
+
+
+def test_guest_instructions_have_bridge_rules_and_guest_access(tmp_path):
+    text = build_developer_instructions(REPO, _mem(tmp_path), guest_uid="222222222")
+    assert "Telegram bridge (codex-gram)" in text
+    assert "guest instance" in text and "222222222" in text
+    assert "Never edit access.json" in text
+
+
+def test_guest_instructions_never_include_owner_workflow_or_memory(tmp_path):
+    mem = _mem(tmp_path, index=SECRET_MEMORY_LINE.encode("utf-8"))
+    text = build_developer_instructions(REPO, mem, guest_uid="222222222")
+    workflow = (REPO / "codex_workflow.md").read_text("utf-8")
+    assert "Рабочий регламент владельца" not in text
+    assert "Согласовываешь план" not in text
+    assert "sg-code-backup" not in text
+    # ни одна содержательная строка регламента не протекла
+    for line in workflow.splitlines():
+        if len(line.strip()) > 30:
+            assert line.strip() not in text, line
+    assert "SECRET_in_memory" not in text
+    assert "MEMORY.md" not in text
+    assert "Индекс памяти" not in text and "Память проекта" not in text
+    assert str(mem) not in text
+    assert "/root/.claude/projects" not in text
+
+
+def test_guest_instructions_ignore_memory_env_and_default_dir(tmp_path, monkeypatch):
+    mem = _mem(tmp_path, index=SECRET_MEMORY_LINE.encode("utf-8"))
+    monkeypatch.setenv("CODEX_GRAM_MEMORY_DIR", str(mem))
+    text = build_developer_instructions(REPO, guest_uid="5")
+    assert "SECRET_in_memory" not in text and DEFAULT_MEMORY_DIR not in text
+
+
+def test_owner_instructions_unchanged_without_guest_uid(tmp_path):
+    mem = _mem(tmp_path, index=SECRET_MEMORY_LINE.encode("utf-8"))
+    text = build_developer_instructions(REPO, mem)
+    assert "Рабочий регламент владельца" in text and "SECRET_in_memory" in text
+    assert "guest instance" not in text

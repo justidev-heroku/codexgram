@@ -172,3 +172,26 @@ def test_smoke_bridge_creates_ephemeral_bridge():
     assert len(calls) == 1
     flags = {kw.arg: kw.value for kw in calls[0].keywords}
     assert isinstance(flags.get("ephemeral"), ast.Constant) and flags["ephemeral"].value is True
+
+
+# --------------------------------------------------------------------------- гости: cwd
+
+from codex_threads import is_own_thread as _own  # noqa: E402
+
+
+def _thr(chat, cwd):
+    return {"id": "t", "preview": f'<channel source="telegram" chat_id="{chat}">hi</channel>', "cwd": cwd}
+
+
+def test_guest_thread_requires_chat_and_cwd():
+    gcwd = "/root/guests-codex/222"
+    assert _own(_thr("222", gcwd), "222", cwd=gcwd)
+    assert not _own(_thr("222", "/root"), "222", cwd=gcwd)        # чат свой, каталог чужой
+    assert not _own(_thr("111", gcwd), "222", cwd=gcwd)           # каталог свой, чат владельца
+    assert not _own({"id": "t", "preview": "", "cwd": gcwd}, "222", cwd=gcwd)
+    assert not _own(_thr("222", gcwd + "/sub"), "222", cwd=gcwd)
+
+
+def test_owner_does_not_see_guest_threads():
+    assert _own(_thr("111", "/root"), "111")
+    assert not _own(_thr("222", "/root/guests-codex/222"), "111")

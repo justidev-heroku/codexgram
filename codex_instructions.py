@@ -7,6 +7,9 @@
 
 Каталог памяти берётся из CODEX_GRAM_MEMORY_DIR. Отсутствие каталога или файла
 не ломает сборку: индекс просто помечается как недоступный.
+
+Гостевой тред (guest_uid задан) получает только правила моста и строку доступа гостя.
+Регламент владельца и его память туда не попадают никогда: в них инфраструктура и секреты.
 """
 
 from __future__ import annotations
@@ -68,8 +71,28 @@ def _index_section(memory_dir: Path) -> str:
     return f"{INDEX_HEADING}\n\n{body.rstrip()}{note}"
 
 
-def build_developer_instructions(repo_dir: Path, memory_dir: Optional[Path] = None) -> str:
+def guest_access_text(guest_uid: str) -> str:
+    return (
+        "## Доступ\n\n"
+        f"This is a guest instance of the bridge: everything in this thread comes from the guest "
+        f"user (Telegram id {guest_uid}), who is the decision-maker here. The bot owner is not "
+        "in this chat. Do not read, quote or send the owner's private files (the owner's notes and "
+        "memory, Codex or Claude credentials, bot tokens, .env files) or other guests' "
+        "directories. Never edit access.json."
+    )
+
+
+def build_guest_instructions(repo_dir: Path, guest_uid: str) -> str:
+    parts = [_read_text(Path(repo_dir) / "codex_instructions.md").strip(), guest_access_text(str(guest_uid))]
+    return "\n\n".join(p for p in parts if p) + "\n"
+
+
+def build_developer_instructions(
+    repo_dir: Path, memory_dir: Optional[Path] = None, *, guest_uid: Optional[str] = None
+) -> str:
     repo_dir = Path(repo_dir)
+    if guest_uid:
+        return build_guest_instructions(repo_dir, guest_uid)
     memory_dir = Path(memory_dir) if memory_dir is not None else memory_dir_from_env()
     parts = [
         _read_text(repo_dir / "codex_instructions.md").strip(),
