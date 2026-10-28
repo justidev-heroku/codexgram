@@ -918,3 +918,50 @@ def test_guest_with_own_bot_sets_guest_menu(gstate, monkeypatch):
     asyncio.run(server._bot_setup())
     names = {c.command for c in fb.set_my_commands.await_args.args[0]}
     assert names == {c for c, _ in server.GUEST_BOT_COMMANDS}
+
+
+# --------------------------------------------------------------------------- PID-файл: чужой server.py не убиваем
+
+
+def _fake_proc(monkeypatch, cmdline: str, environ: dict | None):
+    real_read_text = Path.read_text
+    real_read_bytes = Path.read_bytes
+
+    def read_text(self, *a, **k):
+        if str(self) == "/proc/4242/cmdline":
+            return cmdline
+        return real_read_text(self, *a, **k)
+
+    def read_bytes(self, *a, **k):
+        if str(self) == "/proc/4242/environ":
+            if environ is None:
+                raise PermissionError("denied")
+            return b"\0".join(f"{k}={v}".encode() for k, v in environ.items())
+        return real_read_bytes(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+
+def test_pid_owner_matches_only_owner_poller(monkeypatch):
+    sd = str(server.STATE_DIR)
+    _fake_proc(monkeypatch, "python3\0server.py", {"CLAUDE_TELEGRAM_BACKGROUND": "1", "TELEGRAM_STATE_DIR": sd})
+    assert server.is_bot_process(4242)
+
+
+@pytest.mark.parametrize("environ", [
+    {"CLAUDE_TELEGRAM_BACKGROUND": "1", "TELEGRAM_STATE_DIR": "/elsewhere"},             # другой экземпляр
+    {"CLAUDE_TELEGRAM_BACKGROUND": "1", "CODEX_GRAM_GUEST_UID": GUEST},                    # гость
+    {"CLAUDE_TELEGRAM_BACKGROUND": "0"},                                                  # MCP-процесс
+    None,                                                                                 # environ не читается
+])
+def test_pid_reused_by_other_server_py_is_not_killed(monkeypatch, environ):
+    if environ and "TELEGRAM_STATE_DIR" not in environ and "CODEX_GRAM_GUEST_UID" in environ:
+        environ = {**environ, "TELEGRAM_STATE_DIR": str(server.STATE_DIR)}
+    _fake_proc(monkeypatch, "python3\0server.py", environ)
+    assert not server.is_bot_process(4242)
+
+
+def test_pid_of_unrelated_process_is_not_killed(monkeypatch):
+    _fake_proc(monkeypatch, "sshd", {"CLAUDE_TELEGRAM_BACKGROUND": "1"})
+    assert not server.is_bot_process(4242)

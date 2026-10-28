@@ -189,16 +189,42 @@ def log(msg: str) -> None:
         pass
 
 
-def is_bot_process(pid: int) -> bool:
-    """Проверяет, является ли процесс с данным PID нашим ботом."""
+def _proc_environ(pid: int) -> dict | None:
     try:
-        cmdline_path = Path(f"/proc/{pid}/cmdline")
-        if cmdline_path.exists():
-            cmd = cmdline_path.read_text().lower()
-            return "server.py" in cmd or "claude-telegram-bot" in cmd
-    except Exception:
-        pass
-    return False
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    env = {}
+    for item in raw.split(b"\0"):
+        key, sep, value = item.partition(b"=")
+        if sep:
+            env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
+def is_bot_process(pid: int) -> bool:
+    """Процесс с этим PID — фоновый server.py ЭТОГО экземпляра (тот же STATE_DIR и гость).
+
+    PID-файлы у мастера и у каждого гостя свои. После падения PID мог достаться другому
+    server.py (мастеру, другому гостю, MCP-процессу) — такой процесс не трогаем.
+    """
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_text().lower()
+    except OSError:
+        return False
+    if "server.py" not in cmd:
+        return False
+    env = _proc_environ(pid)
+    if env is None:
+        return False
+    if env.get("CLAUDE_TELEGRAM_BACKGROUND") != "1":
+        return False
+    if (env.get("CODEX_GRAM_GUEST_UID") or "") != GUEST_INSTANCE_UID:
+        return False
+    their_state = env.get("TELEGRAM_STATE_DIR")
+    if their_state is None:
+        return not IS_GUEST_INSTANCE
+    return os.path.realpath(their_state) == os.path.realpath(STATE_DIR)
 
 
 # Telegram разрешает только один getUpdates-потребитель на токен.
