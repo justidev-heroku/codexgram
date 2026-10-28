@@ -1,5 +1,20 @@
 # DEVLOG
 
+## 2026-10-28 — codex-gram: события субагентов больше не ломают ход
+
+Codex запускает субагентов — отдельные треды с parent_thread_id; их `turn/*`, `item/*`, `error`
+приходят в тот же stdio. Раньше мост по ним перезаписывал `active_turn_id` (отсюда
+`turn/steer failed: expected active turn id …`), а server.py на `turn/completed` дочернего хода
+слал ложное «Ход завершился без ответа».
+
+Фикс: `CodexBridge.is_foreign_thread(params)` (threadId в схеме app-server обязателен для
+turn/started, turn/completed, item/*, error; нет threadId или свой тред ещё неизвестен — событие
+считается своим). `_on_turn_started/_on_turn_completed` чужие события игнорируют; слушатели их
+по-прежнему получают. В `_handle_codex_event` чужие turn/*, item/*, error пропускаются (вердикт,
+пузырь, stop_thinking). Единственное исключение: успешный reply из дочернего треда засчитывается
+активному ходу основного (ответ реально ушёл пользователю). Одинаково для владельца и гостей.
+Не задеплоено.
+
 ## 2026-10-28 — codex-gram, этап 3: гости и свои боты
 
 Гостевой рантайм перенесён из claude-gram (эталон `/root/claude-gram-v2`, коммиты 108e0ce, c93e1ec,

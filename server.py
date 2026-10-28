@@ -2838,8 +2838,30 @@ def on_codex_event(method: str, params: dict) -> None:
         log(f"event {method} handling failed: {e}")
 
 
+def _is_foreign_event(params: dict) -> bool:
+    """Событие чужого треда (субагент Codex с parent_thread_id): не относится к ходу владельца."""
+    return codex_bridge is not None and codex_bridge.is_foreign_thread(params)
+
+
 def _handle_codex_event(method: str, params: dict) -> None:
     owner = owner_chat()
+    if method in ("item/started", "item/completed", "turn/started", "turn/completed", "error") \
+            and _is_foreign_event(params):
+        # Исключение: успешный reply из дочернего треда всё же доставил ответ пользователю,
+        # засчитываем его активному ходу основного треда (иначе ложная плашка «без ответа»).
+        item = params.get("item") if method == "item/completed" else None
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "mcpToolCall"
+            and item.get("server") == "telegram"
+            and item.get("tool") in REPLY_TOOL_NAMES
+            and item.get("status") == "completed"
+            and codex_bridge.active_turn_id
+        ):
+            turn_state.note_reply(codex_bridge.active_turn_id)
+            if owner:
+                stop_thinking(owner)
+        return
     if method in ("item/started", "item/completed"):
         phase = "started" if method == "item/started" else "completed"
         item = params.get("item") or {}

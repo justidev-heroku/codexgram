@@ -204,3 +204,102 @@ def test_inbound_from_non_owner_is_not_delivered(owner_env, monkeypatch):
     msg.message_thread_id = None
     asyncio.run(server.handle_inbound(msg, "hello", None))
     deliver.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# События субагентов (чужой threadId)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def main_bridge(monkeypatch):
+    from codex_bridge import CodexBridge
+    b = CodexBridge.__new__(CodexBridge)
+    b.thread_id = "T-main"
+    b.active_turn_id = "TM"
+    monkeypatch.setattr(server, "codex_bridge", b)
+    return b
+
+
+def _warned(bot):
+    return any("без ответа" in (c.args[1] if len(c.args) > 1 else "") for c in bot.send_message.call_args_list)
+
+
+def test_subagent_turn_completed_without_reply_gives_no_warning(owner_env, main_bridge):
+    async def scenario():
+        server.turn_state.set_last_user("<channel>hi</channel>")
+        server.on_codex_event("turn/completed", {
+            "threadId": "T-child", "turn": {"id": "TC", "status": "completed"}})
+        await _settle()
+        await _settle()
+        assert not _warned(owner_env)
+
+    asyncio.run(scenario())
+
+
+def test_subagent_events_do_not_touch_bubble_or_error(owner_env, main_bridge):
+    async def scenario():
+        await server.start_thinking("111")
+        server.on_codex_event("item/started", {"threadId": "T-child", "turnId": "TC", "item": {
+            "id": "c1", "type": "commandExecution", "command": "ls", "status": "inProgress"}})
+        assert server.progress_bubbles["111"]["tracker"].actions() == []
+        server.on_codex_event("turn/completed", {
+            "threadId": "T-child", "turn": {"id": "TC", "status": "completed"}})
+        server.on_codex_event("error", {"threadId": "T-child", "turnId": "TC",
+                                        "error": {"message": "boom"}, "willRetry": False})
+        await _settle()
+        assert "111" in server.progress_bubbles
+        server.stop_thinking("111")
+        await _settle()
+
+    asyncio.run(scenario())
+
+
+def test_main_turn_with_reply_no_warning_even_after_subagent_noise(owner_env, main_bridge):
+    async def scenario():
+        server.turn_state.set_last_user("<channel>hi</channel>")
+        server.on_codex_event("turn/completed", {"threadId": "T-child", "turn": {"id": "TC", "status": "completed"}})
+        item = {"id": "r1", "type": "mcpToolCall", "server": "telegram", "tool": "reply", "status": "completed"}
+        server.on_codex_event("item/completed", {"threadId": "T-main", "turnId": "TM", "item": item})
+        server.on_codex_event("turn/completed", {"threadId": "T-main", "turn": {"id": "TM", "status": "completed"}})
+        await _settle()
+        await _settle()
+        assert not _warned(owner_env)
+
+    asyncio.run(scenario())
+
+
+def test_main_turn_without_reply_still_warns(owner_env, main_bridge):
+    async def scenario():
+        server.turn_state.set_last_user("<channel>hi</channel>")
+        server.on_codex_event("turn/completed", {"threadId": "T-child", "turn": {"id": "TC", "status": "completed"}})
+        server.on_codex_event("turn/completed", {"threadId": "T-main", "turn": {"id": "TM", "status": "completed"}})
+        await _settle()
+        await _settle()
+        assert _warned(owner_env)
+
+    asyncio.run(scenario())
+
+
+def test_subagent_reply_counts_for_active_main_turn(owner_env, main_bridge):
+    async def scenario():
+        server.turn_state.set_last_user("<channel>hi</channel>")
+        item = {"id": "r1", "type": "mcpToolCall", "server": "telegram", "tool": "reply", "status": "completed"}
+        server.on_codex_event("item/completed", {"threadId": "T-child", "turnId": "TC", "item": item})
+        server.on_codex_event("turn/completed", {"threadId": "T-main", "turn": {"id": "TM", "status": "completed"}})
+        await _settle()
+        await _settle()
+        assert not _warned(owner_env)
+
+    asyncio.run(scenario())
+
+
+def test_events_without_thread_id_keep_old_behaviour(owner_env, main_bridge):
+    async def scenario():
+        server.turn_state.set_last_user("<channel>hi</channel>")
+        server.on_codex_event("turn/completed", {"turn": {"id": "TM", "status": "completed"}})
+        await _settle()
+        await _settle()
+        assert _warned(owner_env)
+
+    asyncio.run(scenario())

@@ -427,12 +427,25 @@ class CodexBridge:
                 return
             await self._start_turn_locked(self._take_queue())
 
+    def is_foreign_thread(self, params: dict) -> bool:
+        """True, если уведомление пришло от чужого треда (субагент с parent_thread_id).
+
+        app-server шлёт события дочерних тредов в тот же stdio. Без threadId в params
+        (или пока свой тред неизвестен) считаем событие своим: старое поведение.
+        """
+        tid = params.get("threadId") if isinstance(params, dict) else None
+        return bool(tid) and self.thread_id is not None and tid != self.thread_id
+
     def _on_turn_started(self, params: dict) -> None:
+        if self.is_foreign_thread(params):
+            return
         turn_id = (params.get("turn") or {}).get("id")
         if turn_id and turn_id not in self._done_turns:
             self.active_turn_id = turn_id
 
     def _on_turn_completed(self, params: dict) -> None:
+        if self.is_foreign_thread(params):
+            return
         turn_id = (params.get("turn") or {}).get("id")
         if turn_id:
             self._done_turns.add(turn_id)

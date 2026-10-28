@@ -487,3 +487,69 @@ def test_rpc_error_is_bridge_error_subclass():
     err = RPCError(-32000, "boom")
     assert isinstance(err, BridgeError)
     assert err.code == -32000
+
+
+# ---------------------------------------------------------------------------
+# События дочерних тредов (субагенты с parent_thread_id)
+# ---------------------------------------------------------------------------
+
+
+def _bare_bridge(tmp_path):
+    env = Env(tmp_path)
+    b = env.bridge
+    b.thread_id = "T-main"
+    b._ready.set()
+    return b
+
+
+def test_subagent_turn_events_do_not_touch_active_turn(tmp_path):
+    b = _bare_bridge(tmp_path)
+    b.active_turn_id = "turn-main"
+    b._dispatch_notification({"method": "turn/started", "params": {
+        "threadId": "T-child", "turn": {"id": "turn-child"}}})
+    assert b.active_turn_id == "turn-main"
+    b._dispatch_notification({"method": "turn/completed", "params": {
+        "threadId": "T-child", "turn": {"id": "turn-child", "status": "completed"}}})
+    assert b.active_turn_id == "turn-main"
+    assert "turn-child" not in b._done_turns
+
+
+def test_steer_uses_main_turn_id_after_subagent_events(tmp_path):
+    b = _bare_bridge(tmp_path)
+    b.active_turn_id = "turn-main"
+    calls = []
+
+    async def fake_request(method, params, *a, **k):
+        calls.append((method, params))
+        return {}
+
+    b._request = fake_request
+    b._dispatch_notification({"method": "turn/started", "params": {
+        "threadId": "T-child", "turn": {"id": "turn-child"}}})
+    assert run(b.submit("hello")) == "steered"
+    assert calls[0][0] == "turn/steer"
+    assert calls[0][1]["expectedTurnId"] == "turn-main"
+    assert calls[0][1]["threadId"] == "T-main"
+
+
+def test_own_thread_and_missing_thread_id_keep_old_behaviour(tmp_path):
+    b = _bare_bridge(tmp_path)
+    b._dispatch_notification({"method": "turn/started", "params": {
+        "threadId": "T-main", "turn": {"id": "t1"}}})
+    assert b.active_turn_id == "t1"
+    b._dispatch_notification({"method": "turn/completed", "params": {
+        "threadId": "T-main", "turn": {"id": "t1"}}})
+    assert b.active_turn_id is None
+    b._dispatch_notification({"method": "turn/started", "params": {"turn": {"id": "t2"}}})
+    assert b.active_turn_id == "t2"
+    b._dispatch_notification({"method": "turn/completed", "params": {"turn": {"id": "t2"}}})
+    assert b.active_turn_id is None
+
+
+def test_listeners_still_get_foreign_events(tmp_path):
+    b = _bare_bridge(tmp_path)
+    seen = []
+    b._listeners.append(lambda m, p: seen.append((m, p.get("threadId"))))
+    b._dispatch_notification({"method": "turn/completed", "params": {
+        "threadId": "T-child", "turn": {"id": "x"}}})
+    assert seen == [("turn/completed", "T-child")]
