@@ -166,18 +166,20 @@ def test_listener_failure_never_propagates(owner_env):
     server.on_codex_event("turn/completed", None)  # type: ignore[arg-type]
 
 
-def test_guest_update_is_answered_and_not_handled(owner_env, monkeypatch):
-    server.load_access.cache_clear() if hasattr(server.load_access, "cache_clear") else None
+def test_guest_update_is_forwarded_and_not_handled(owner_env, monkeypatch):
     (server.STATE_DIR / "access.json").write_bytes(orjson.dumps({"allowFrom": ["111", "222"], "owner": "111"}))
     handler = AsyncMock()
-    update = SimpleNamespace(message=SimpleNamespace(text="hi"), from_user=SimpleNamespace(id=222, username=None,
-                                                                                         first_name="g", last_name=None, is_bot=False))
-    update.event = update
-    monkeypatch.setattr(server, "extract_update_user", lambda u: update.from_user)
+    fwd = AsyncMock(return_value=True)
+    monkeypatch.setattr(server, "forward_to_guest", fwd)
+    user = SimpleNamespace(id=222, username=None, first_name="g", last_name=None, is_bot=False)
+    update = MagicMock()
+    update.message = SimpleNamespace(text="hi", model_extra={})
+    update.model_dump.return_value = {"update_id": 1, "message": {"text": "hi"}}
+    monkeypatch.setattr(server, "extract_update_user", lambda u: user)
     asyncio.run(server._guest_router_mw(handler, update, {}))
     handler.assert_not_awaited()
-    owner_env.send_message.assert_awaited()
-    assert owner_env.send_message.call_args[0][0] == 222
+    fwd.assert_awaited_once()
+    assert fwd.await_args.args[0] == "222"
 
 
 def test_owner_update_passes_to_handler(owner_env, monkeypatch):
